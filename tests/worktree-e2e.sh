@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# End-to-end test for Sail in linked git worktrees, on pgsql.
+#
+# Creates a fresh Laravel application that keeps this copy of Sail installed, makes it a git
+# repository, starts its Sail stack in the main checkout and drives real git, docker and sail
+# commands in linked worktrees. It asserts only observable results: exit codes, output, files
+# and databases.
+#
+#   tests/worktree-e2e.sh
+#
+# Needs git, docker, php and composer on the host (php and composer only to create the
+# application; the linked worktree commands run with php and jq hidden from PATH).
+# SAIL_E2E_PHP (default 8.5) and SAIL_E2E_LARAVEL (default 12.x) choose the application.
+# Host ports are picked by Docker, so runs never collide with other stacks.
+set -euo pipefail
+
+SAIL_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+PHP_VERSION="${SAIL_E2E_PHP:-8.5}"
+LARAVEL_VERSION="${SAIL_E2E_LARAVEL:-12.x}"
+WORK="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/sail-e2e.XXXXXX")" && pwd -P)"
+APP="$WORK/app"
+PROJECT="sail-e2e-$(printf '%s' "${WORK##*.}" | tr '[:upper:]' '[:lower:]')"
+
+export GIT_AUTHOR_NAME=sail-e2e GIT_AUTHOR_EMAIL=sail-e2e@example.com
+export GIT_COMMITTER_NAME=sail-e2e GIT_COMMITTER_EMAIL=sail-e2e@example.com
+
+function cleanup {
+    if [ -x "$APP/vendor/bin/sail" ]; then
+        (cd "$APP" && vendor/bin/sail down -v > /dev/null 2>&1) || true
+    fi
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+function fail {
+    echo "not ok - $*" >&2
+    exit 1
+}
+
+function pass {
+    echo "ok - $*"
+}
+
+# expect_failure <description> <expected output> <command...>
+function expect_failure {
+    local output
+
+    if output="$("${@:3}" 2>&1)"; then
+        fail "$1: expected a failure, got: $output"
+    fi
+
+    grep -qF -- "$2" <<< "$output" || fail "$1: expected output containing '$2', got: $output"
+    pass "$1"
+}
+
+# psql_query <database> <sql>: runs a query against the main checkout's database service.
+function psql_query {
+    (cd "$APP" && docker compose exec -T database psql -U sail -d "$1" -tAc "$2")
+}
+
+function database_exists {
+    [ "$(psql_query postgres "SELECT 1 FROM pg_database WHERE datname = '$1'")" == "1" ]
+}
+
+function table_exists {
+    [ "$(psql_query "$1" "SELECT to_regclass('public.$2') IS NOT NULL")" == "t" ]
+}
+
+echo "# Work dir: $WORK"
+
+echo "# Creating a Laravel application with Sail installed (pgsql)"
+composer create-project laravel/laravel "$APP" "$LARAVEL_VERSION" --remove-vcs --no-interaction --prefer-dist --quiet
+cd "$APP"
+composer config minimum-stability dev
+composer config repositories.sail "{\"type\": \"path\", \"url\": \"$SAIL_REPO\", \"options\": {\"symlink\": false}}"
+composer require laravel/sail:* --dev -W --no-interaction --quiet
+php artisan sail:install --php="$PHP_VERSION" --with=pgsql --no-interaction
+
+# Rename the app and database services and set a project name unlike the directory name, so
+# nothing can be derived from names. Declare an app service variable that must reach commands.
+sed -i.bak \
+    -e 's/^    laravel\.test:/    app:/' \
+    -e 's/^    pgsql:/    database:/' \
+    -e 's/- pgsql$/- database/' \
+    -e '/LARAVEL_SAIL: 1$/{p;s/LARAVEL_SAIL: 1/SAIL_E2E_SERVICE_VAR: from-compose/;}' \
+    compose.yaml
+rm compose.yaml.bak
+sed -i.bak -e 's/^DB_HOST=.*/DB_HOST=database/' .env
+rm .env.bak
+cat >> .env << EOF
+APP_SERVICE=app
+COMPOSE_PROJECT_NAME=$PROJECT
+APP_PORT=0
+FORWARD_DB_PORT=0
+VITE_PORT=$((20000 + RANDOM % 20000))
+EOF
+echo '{}' > auth.json
+mkdir -p node_modules/sail-e2e
+echo marker > node_modules/sail-e2e/marker
+
+git init -q -b main
+git add -A
+git commit -q -m "Initial application"
+
+echo "# Main checkout: upstream Sail steps"
+vendor/bin/sail up -d --wait
+vendor/bin/sail artisan migrate --no-interaction
+vendor/bin/sail test
+pass "main checkout: up, migrate and test"
+MAIN_MIGRATIONS="$(psql_query laravel "SELECT count(*) FROM migrations")"
+
+expect_failure "worktree setup refused in the main checkout" "main checkout" vendor/bin/sail worktree setup
+
+# Linked worktree commands must not need php or jq on the host.
+mkdir "$WORK/no-host-tools"
+for TOOL in php jq; do
+    printf '#!/bin/sh\necho "host %s must not be used" >&2\nexit 97\n' "$TOOL" > "$WORK/no-host-tools/$TOOL"
+    chmod +x "$WORK/no-host-tools/$TOOL"
+done
+export PATH="$WORK/no-host-tools:$PATH"
+
+echo "# Linked worktree"
+WORKTREE="$WORK/Wt.One"
+git worktree add -q -b wt-one "$WORKTREE"
+cd "$WORKTREE"
+WORKTREE_DATABASE="sail_wt_wt_one_$(printf '%s' "$WORKTREE" | git hash-object --stdin | cut -c1-8)"
+
+"$APP/vendor/bin/sail" worktree setup
+cmp -s "$APP/.env" .env || fail "setup copies .env"
+cmp -s "$APP/auth.json" auth.json || fail "setup copies auth.json"
+[ -x vendor/bin/sail ] || fail "setup copies vendor"
+[ -f node_modules/sail-e2e/marker ] || fail "setup copies node_modules"
+database_exists "$WORKTREE_DATABASE" || fail "setup creates worktree database $WORKTREE_DATABASE"
+pass "setup copies env, auth.json, dependencies and creates $WORKTREE_DATABASE"
+
+vendor/bin/sail worktree setup > /dev/null
+pass "setup is re-runnable"
+
+EXPECTED="$WORKTREE_DATABASE|${WORKTREE_DATABASE}_|${WORKTREE_DATABASE}_cache_|from-compose|sail-e2e"
+ACTUAL="$(AI_AGENT=sail-e2e vendor/bin/sail php -r 'echo implode("|", array_map("getenv", ["DB_DATABASE", "REDIS_PREFIX", "CACHE_PREFIX", "SAIL_E2E_SERVICE_VAR", "AI_AGENT"]));')"
+[ "$ACTUAL" == "$EXPECTED" ] || fail "environment: expected $EXPECTED, got $ACTUAL"
+pass "worktree, service and agent variables reach the throwaway container"
+
+vendor/bin/sail artisan make:migration create_wt_markers_table > /dev/null
+MIGRATION="$(ls database/migrations/*_create_wt_markers_table.php)"
+[ -O "$MIGRATION" ] || fail "files created in the container are owned by the host user"
+pass "files created in the container are owned by the host user"
+
+vendor/bin/sail run git status --porcelain | grep -qF "?? $MIGRATION" || fail "git works inside the throwaway container"
+pass "git works inside the throwaway container"
+
+vendor/bin/sail artisan migrate --no-interaction
+table_exists "$WORKTREE_DATABASE" wt_markers || fail "migrate runs against the worktree database"
+vendor/bin/sail test
+table_exists laravel wt_markers && fail "main checkout's database gained the worktree's table"
+[ "$(psql_query laravel "SELECT count(*) FROM migrations")" == "$MAIN_MIGRATIONS" ] || fail "main checkout's migrations changed"
+pass "migrate and test pass in the linked worktree, main checkout's database untouched"
+
+vendor/bin/sail composer --version > /dev/null
+vendor/bin/sail bin phpunit --version > /dev/null
+pass "composer and bin run in the throwaway container"
+
+cmp -s "$APP/.env" .env || fail "the copied .env is not rewritten"
+pass "the copied .env is not rewritten"
+
+expect_failure "unknown commands are refused" "$APP" vendor/bin/sail up -d
+
+echo "# Unsupported layouts"
+git clone -q --bare "$APP" "$WORK/bare.git"
+git -C "$WORK/bare.git" worktree add -q "$WORK/bare-wt"
+cd "$WORK/bare-wt"
+expect_failure "bare-repository layout is unsupported" "unsupported" "$APP/vendor/bin/sail" artisan --version
+
+git init -q "$WORK/nested"
+mkdir "$WORK/nested/app"
+touch "$WORK/nested/app/artisan"
+git -C "$WORK/nested" add -A
+git -C "$WORK/nested" commit -q -m "App in a subdirectory"
+git -C "$WORK/nested" worktree add -q "$WORK/nested-wt"
+cd "$WORK/nested-wt/app"
+expect_failure "app outside the git root is unsupported" "unsupported" "$APP/vendor/bin/sail" artisan --version
+
+echo "# Main checkout's Sail stack down"
+cd "$APP"
+vendor/bin/sail down
+cd "$WORKTREE"
+expect_failure "commands name the main checkout when its stack is down" "$APP" vendor/bin/sail artisan --version
+expect_failure "commands say how to start the stack" "sail up" vendor/bin/sail artisan --version
+
+echo "# All worktree end-to-end checks passed"

@@ -224,6 +224,12 @@ if [ -n "$SAIL_FILES" ]; then
     done
 fi
 
+# Hand off to the worktree script in a linked git worktree, or for "sail worktree ..."...
+if [ "$1" == "worktree" ] || [ "$(git rev-parse --path-format=absolute --git-dir 2> /dev/null)" != "$(git rev-parse --path-format=absolute --git-common-dir 2> /dev/null)" ]; then
+    # shellcheck source=/dev/null
+    source "$(dirname "${BASH_SOURCE[0]}")/sail-worktree"
+fi
+
 EXEC="yes"
 
 if [ -z "$SAIL_SKIP_CHECKS" ]; then
