@@ -38,7 +38,7 @@ case "$1" in
             [ "$(git rev-parse --path-format=absolute --git-dir)" != "$(git rev-parse --path-format=absolute --git-common-dir)" ] || exit 0
             sail="$(git worktree list --porcelain | sed -n '1s/^worktree //p')/vendor/bin/sail"
             [ -x "$sail" ] || exit 0
-            "$sail" worktree setup || echo "Sail worktree setup failed. Fix the problem above, then run in this linked worktree: \"$sail\" worktree setup" >&2
+            "$sail" worktree setup --hook || echo "Sail worktree setup failed. Fix the problem above, then run in this linked worktree: \"$sail\" worktree setup" >&2
         )
         ;;
 esac

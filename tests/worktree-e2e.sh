@@ -545,4 +545,97 @@ cd "$WORKTREE"
 expect_failure "commands name the main checkout when its stack is down" "$APP" vendor/bin/sail artisan --version
 expect_failure "commands say how to start the stack" "sail up" vendor/bin/sail artisan --version
 
+# --- Two-phase, lazy and concurrent setup (#9) ---
+# worktree_database_of <dir>: the worktree database name of a linked worktree.
+function worktree_database_of {
+    local SLUG
+
+    SLUG="$(printf '%s' "${1##*/}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_')"
+    echo "sail_wt_${SLUG:0:32}_$(printf '%s' "$1" | git hash-object --stdin | cut -c1-8)"
+}
+
+# worktree_database_ready <dir>: the linked worktree's database exists.
+function worktree_database_ready {
+    if [ "$DB" == "sqlite" ]; then
+        [ -f "$1/database/database.sqlite" ]
+    else
+        database_exists "$(worktree_database_of "$1")"
+    fi
+}
+
+# setup_runs <file>: how many times worktree setup completed in the output saved in <file>.
+function setup_runs {
+    grep -cF "Worktree setup complete" "$1" || true
+}
+
+cd "$APP"
+OUTPUT="$(git worktree add -b wt-lazy "$WORK/wt-lazy" 2>&1)" || fail "git worktree add with the stack down: $OUTPUT"
+grep -qF "will finish on the first sail command" <<< "$OUTPUT" || fail "the hook says setup finishes later, got: $OUTPUT"
+cd "$WORK/wt-lazy"
+cmp -s "$APP/.env" .env || fail "with the stack down, the hook copies .env"
+[ -x vendor/bin/sail ] && [ -f node_modules/sail-e2e/marker ] || fail "with the stack down, the hook copies dependencies"
+pass "with the stack down, git worktree add copies env files and dependencies and says setup finishes later"
+
+expect_failure "with the stack still down, a command fails" "Sail stack is not running" vendor/bin/sail artisan --version
+
+(cd "$APP" && vendor/bin/sail up -d --wait)
+vendor/bin/sail artisan --version > "$WORK/lazy-first.out" 2>&1 || { cat "$WORK/lazy-first.out" >&2; fail "the first command after the stack starts"; }
+[ "$(setup_runs "$WORK/lazy-first.out")" == "1" ] || fail "the first command completes setup, got: $(cat "$WORK/lazy-first.out")"
+grep -qF "Laravel Framework" "$WORK/lazy-first.out" || fail "the first command runs after setup"
+grep -qF "Installing dependencies" "$WORK/lazy-first.out" && fail "copied dependencies matching the lockfile are not installed again"
+worktree_database_ready "$WORK/wt-lazy" || fail "the first command creates the worktree database"
+pass "after the stack starts, the first command completes setup, then runs"
+
+vendor/bin/sail artisan --version > "$WORK/lazy-second.out" 2>&1 || fail "a later command"
+[ "$(setup_runs "$WORK/lazy-second.out")" == "0" ] || fail "a later command repeats setup"
+pass "later commands do not repeat setup"
+
+cd "$APP"
+git -c core.hooksPath=/dev/null worktree add -q -b wt-race "$WORK/wt-race"
+cd "$WORK/wt-race"
+"$APP/vendor/bin/sail" artisan --version > "$WORK/race-1.out" 2>&1 &
+RACE_1=$!
+"$APP/vendor/bin/sail" artisan --version > "$WORK/race-2.out" 2>&1 &
+RACE_2=$!
+wait "$RACE_1" || { cat "$WORK/race-1.out" >&2; fail "the first of two concurrent commands"; }
+wait "$RACE_2" || { cat "$WORK/race-2.out" >&2; fail "the second of two concurrent commands"; }
+[ "$(( $(setup_runs "$WORK/race-1.out") + $(setup_runs "$WORK/race-2.out") ))" == "1" ] \
+    || fail "two concurrent commands run setup once, got: $(cat "$WORK/race-1.out" "$WORK/race-2.out")"
+grep -qF "Laravel Framework" "$WORK/race-1.out" || fail "the first concurrent command runs"
+grep -qF "Laravel Framework" "$WORK/race-2.out" || fail "the second concurrent command runs"
+pass "two concurrent commands in a fresh linked worktree run setup once, then both run"
+
+# Kill a setup once phase 1 copied the dependencies, so its lock stays behind...
+cd "$APP"
+git -c core.hooksPath=/dev/null worktree add -q -b wt-killed "$WORK/wt-killed"
+cd "$WORK/wt-killed"
+"$APP/vendor/bin/sail" artisan --version > /dev/null 2>&1 &
+KILLED=$!
+for _ in $(seq 600); do
+    [ -f node_modules/sail-e2e/marker ] && break
+    sleep 0.1
+done
+[ -f node_modules/sail-e2e/marker ] || fail "the setup to kill copies dependencies"
+kill -STOP "$KILLED"
+pkill -KILL -P "$KILLED" || true
+kill -KILL "$KILLED"
+wait "$KILLED" 2> /dev/null || true
+"$APP/vendor/bin/sail" artisan --version > "$WORK/killed.out" 2>&1 || { cat "$WORK/killed.out" >&2; fail "a command after a killed setup"; }
+[ "$(setup_runs "$WORK/killed.out")" == "1" ] || fail "a command after a killed setup completes setup, got: $(cat "$WORK/killed.out")"
+pass "a lock left by a killed setup does not block setup"
+
+cd "$APP"
+PARALLEL=()
+for N in 1 2 3; do
+    git worktree add -b "wt-par-$N" "$WORK/wt-par-$N" > "$WORK/par-$N.out" 2>&1 &
+    PARALLEL+=($!)
+done
+for N in 1 2 3; do
+    wait "${PARALLEL[$((N - 1))]}" || fail "parallel git worktree add $N: $(cat "$WORK/par-$N.out")"
+    [ "$(setup_runs "$WORK/par-$N.out")" == "1" ] || fail "parallel git worktree add $N sets up, got: $(cat "$WORK/par-$N.out")"
+    worktree_database_ready "$WORK/wt-par-$N" || fail "parallel git worktree add $N creates its worktree database"
+done
+pass "parallel git worktree add runs all set up, each with its own worktree database"
+# --- End two-phase, lazy and concurrent setup (#9) ---
+
 echo "# All worktree end-to-end checks passed"
