@@ -363,6 +363,105 @@ for COMMAND in down share dusk; do
 done
 # --- End command surface (#4) ---
 
+# --- Prune (#7) ---
+echo "# Prune"
+# worktree_database_of <linked worktree path>: its worktree database name, per the spec's naming.
+function worktree_database_of {
+    printf 'sail_wt_%s_%s' "$(printf '%s' "${1##*/}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_')" \
+        "$(printf '%s' "$1" | git hash-object --stdin | cut -c1-8)"
+}
+
+# add_set_up_worktree <path>: git worktree add, whose hook runs worktree setup.
+function add_set_up_worktree {
+    git -C "$APP" worktree add -q -b "${1##*/}" "$1"
+    if [ "$DB" != "sqlite" ]; then
+        database_exists "$(worktree_database_of "$1")" || fail "git worktree add creates the worktree database of $1"
+    fi
+}
+
+if [ "$DB" == "sqlite" ]; then
+    OUTPUT="$(vendor/bin/sail worktree prune 2>&1)" || fail "prune on sqlite exits 0: $OUTPUT"
+    [ -z "$OUTPUT" ] || fail "prune on sqlite does nothing, got: $OUTPUT"
+    OUTPUT="$(cd "$APP" && vendor/bin/sail worktree prune 2>&1)" || fail "prune on sqlite in the main checkout exits 0: $OUTPUT"
+    pass "prune on sqlite does nothing"
+else
+    if [ "$DB" == "pgsql" ]; then
+        CREATE_IN=postgres
+    else
+        CREATE_IN=information_schema
+    fi
+
+    REMOVED="$WORK/gone-removed"
+    DELETED="$WORK/gone-deleted"
+    add_set_up_worktree "$REMOVED"
+    add_set_up_worktree "$DELETED"
+    REMOVED_DATABASE="$(worktree_database_of "$REMOVED")"
+    DELETED_DATABASE="$(worktree_database_of "$DELETED")"
+    HOOKED_DATABASE="$(worktree_database_of "$HOOKED")"
+    for NAME in "${REMOVED_DATABASE}_test_1" "${REMOVED_DATABASE}_test_12" sail_wt_unrelated unrelated_db; do
+        db_query "$CREATE_IN" "CREATE DATABASE $NAME" > /dev/null
+    done
+
+    git -C "$APP" worktree remove --force "$REMOVED"
+    rm -rf "$DELETED"
+
+    # An open connection to a database prune drops...
+    if [ "$DB" == "pgsql" ]; then
+        (cd "$APP" && docker compose exec -T database psql -U sail -d "$REMOVED_DATABASE" -c 'SELECT pg_sleep(300)' > /dev/null 2>&1) &
+        HOLDER=$!
+        for _ in $(seq 30); do
+            [ "$(db_query postgres "SELECT count(*) FROM pg_stat_activity WHERE datname = '$REMOVED_DATABASE'")" != "0" ] && break
+            sleep 1
+        done
+        [ "$(db_query postgres "SELECT count(*) FROM pg_stat_activity WHERE datname = '$REMOVED_DATABASE'")" != "0" ] \
+            || fail "a connection to $REMOVED_DATABASE is open before prune"
+    fi
+
+    (cd "$APP" && vendor/bin/sail worktree prune) || fail "sail worktree prune runs in the main checkout"
+    for NAME in "$REMOVED_DATABASE" "${REMOVED_DATABASE}_test_1" "${REMOVED_DATABASE}_test_12" "$DELETED_DATABASE"; do
+        database_exists "$NAME" && fail "prune drops $NAME"
+    done
+    for NAME in "$WORKTREE_DATABASE" "${WORKTREE_DATABASE}_test_1" "$HOOKED_DATABASE" laravel sail_wt_unrelated unrelated_db; do
+        database_exists "$NAME" || fail "prune keeps $NAME"
+    done
+    if [ "$DB" == "pgsql" ]; then
+        wait "$HOLDER" || true
+    fi
+    pass "prune in the main checkout drops removed and deleted linked worktrees' databases, keeps the rest"
+
+    REMOVED="$WORK/gone-from-linked"
+    add_set_up_worktree "$REMOVED"
+    git -C "$APP" worktree remove --force "$REMOVED"
+    vendor/bin/sail worktree prune > /dev/null
+    database_exists "$(worktree_database_of "$REMOVED")" && fail "prune in a linked worktree drops the removed worktree's database"
+    database_exists "$WORKTREE_DATABASE" || fail "prune in a linked worktree keeps its own database"
+    pass "prune runs in a linked worktree"
+
+    REMOVED="$WORK/gone-before-setup"
+    add_set_up_worktree "$REMOVED"
+    git -C "$APP" worktree remove --force "$REMOVED"
+    vendor/bin/sail worktree setup > /dev/null
+    database_exists "$(worktree_database_of "$REMOVED")" && fail "worktree setup prunes first"
+    pass "worktree setup prunes before creating its database"
+
+    # Prunes racing a linked worktree's setup never drop its database...
+    (for _ in 1 2 3 4 5; do (cd "$APP" && vendor/bin/sail worktree prune > /dev/null) || exit 1; done) &
+    PRUNES=$!
+    (cd "$APP" && vendor/bin/sail worktree prune > /dev/null) &
+    PRUNE=$!
+    RACED="$WORK/raced"
+    add_set_up_worktree "$RACED"
+    wait "$PRUNES" || fail "concurrent prunes succeed"
+    wait "$PRUNE" || fail "concurrent prunes succeed"
+    database_exists "$(worktree_database_of "$RACED")" || fail "prunes during worktree setup keep its database"
+    pass "prunes running while a linked worktree is set up keep its database"
+
+    for NAME in sail_wt_unrelated unrelated_db; do
+        db_query "$CREATE_IN" "DROP DATABASE $NAME" > /dev/null
+    done
+fi
+# --- End prune (#7) ---
+
 expect_failure "unknown commands are refused" "$APP" vendor/bin/sail up -d
 
 echo "# Unsupported layouts"
@@ -386,5 +485,10 @@ vendor/bin/sail down
 cd "$WORKTREE"
 expect_failure "commands name the main checkout when its stack is down" "$APP" vendor/bin/sail artisan --version
 expect_failure "commands say how to start the stack" "sail up" vendor/bin/sail artisan --version
+# --- Prune, Sail stack down (#7) ---
+if [ "$DB" != "sqlite" ]; then
+    expect_failure "prune names the main checkout when its stack is down" "$APP" vendor/bin/sail worktree prune
+fi
+# --- End prune, Sail stack down (#7) ---
 
 echo "# All worktree end-to-end checks passed"

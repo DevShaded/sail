@@ -33,25 +33,31 @@ fi
 
 MAIN_CHECKOUT="$(sed -n '1s/^worktree //p' <<< "$WORKTREE_LIST")"
 
+# Print the 8-character hash of a linked worktree's absolute path, as used in its worktree database
+# name...
+function worktree_hash {
+    printf '%s' "$1" | git hash-object --stdin | cut -c1-8
+}
+
+# The main checkout runs only "sail worktree prune"...
 if [ "$GIT_DIR" == "$GIT_COMMON_DIR" ]; then
-    if [ "${2:-}" == "setup" ]; then
-        worktree_fail "This is the main checkout: worktree setup runs only in a linked worktree."
+    case "${2:-}" in
+        prune) ;;
+        setup) worktree_fail "This is the main checkout: worktree setup runs only in a linked worktree." ;;
+        *) worktree_fail "Usage: sail worktree prune" ;;
+    esac
+else
+    WORKTREE_DIR="$(git rev-parse --show-toplevel)"
+
+    if [ "$(pwd -P)" != "$WORKTREE_DIR" ]; then
+        worktree_fail "Sail for an application that is not at the root of its git repository is unsupported." \
+            "Run Sail from the root of the linked worktree: $WORKTREE_DIR"
     fi
 
-    worktree_fail "Usage: sail worktree setup"
+    # Worktree database: sail_wt_<slug>_<hash8>...
+    WORKTREE_SLUG="$(printf '%s' "${WORKTREE_DIR##*/}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_')"
+    WORKTREE_DATABASE="sail_wt_${WORKTREE_SLUG:0:32}_$(worktree_hash "$WORKTREE_DIR")"
 fi
-
-WORKTREE_DIR="$(git rev-parse --show-toplevel)"
-
-if [ "$(pwd -P)" != "$WORKTREE_DIR" ]; then
-    worktree_fail "Sail for an application that is not at the root of its git repository is unsupported." \
-        "Run Sail from the root of the linked worktree: $WORKTREE_DIR"
-fi
-
-# Worktree database: sail_wt_<slug>_<hash8>...
-WORKTREE_SLUG="$(printf '%s' "${WORKTREE_DIR##*/}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_')"
-WORKTREE_HASH="$(printf '%s' "$WORKTREE_DIR" | git hash-object --stdin)"
-WORKTREE_DATABASE="sail_wt_${WORKTREE_SLUG:0:32}_${WORKTREE_HASH:0:8}"
 
 # Print a variable from the main checkout's env file, loaded the way bin/sail loads it...
 function main_env {
@@ -233,12 +239,9 @@ function worktree_setup {
         fi
     done
 
-    case "$DB_CONNECTION" in
-        pgsql|mysql|mariadb|sqlite) ;;
-        *) worktree_fail "Worktree setup does not support the database driver '$DB_CONNECTION'." ;;
-    esac
-
+    check_database_driver
     resolve_sail_stack
+    prune_worktree_databases
 
     case "$DB_CONNECTION" in
         pgsql) pgsql_create_database ;;
@@ -247,6 +250,91 @@ function worktree_setup {
     esac
 
     echo "${GREEN}Worktree setup complete.${NC} Worktree database: $WORKTREE_DATABASE"
+}
+
+function check_database_driver {
+    case "$DB_CONNECTION" in
+        pgsql|mysql|mariadb|sqlite) ;;
+        *) worktree_fail "Sail worktrees do not support the database driver '$DB_CONNECTION'." ;;
+    esac
+}
+
+# Drop the worktree databases, with or without a _test_N suffix, of linked worktrees that are gone.
+# Needs a resolved Sail stack. Databases are listed before live linked worktrees, so a linked
+# worktree created meanwhile keeps its database. A lock in the git common dir serialises prunes.
+function prune_worktree_databases {
+    local LOCK="$GIT_COMMON_DIR/sail-worktree/prune.lock" STATUS=0
+
+    if [ "$DB_CONNECTION" == "sqlite" ]; then
+        return
+    fi
+
+    acquire_prune_lock "$LOCK"
+    drop_dead_worktree_databases || STATUS=$?
+    rm -rf "$LOCK"
+
+    if [ "$STATUS" != 0 ]; then
+        exit "$STATUS"
+    fi
+}
+
+# Take the lock directory, taking it over when its holder died...
+function acquire_prune_lock {
+    local HOLDER
+
+    mkdir -p "${1%/*}"
+    until mkdir "$1" 2> /dev/null; do
+        HOLDER="$(cat "$1/pid" 2> /dev/null)"
+        if [ -n "$HOLDER" ] && ! kill -0 "$HOLDER" 2> /dev/null; then
+            rm -rf "$1"
+        else
+            sleep 1
+        fi
+    done
+
+    echo $$ > "$1/pid"
+}
+
+function drop_dead_worktree_databases {
+    local DATABASES LIVE=" " LINE NAME HASHES HASH
+
+    case "$DB_CONNECTION" in
+        pgsql) DATABASES="$(pgsql_query "SELECT datname FROM pg_database WHERE datname LIKE 'sail_wt_%'")" || return 1 ;;
+        *) DATABASES="$(mysql_query "SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'sail_wt_%'")" || return 1 ;;
+    esac
+
+    # A linked worktree is live when git lists it and its directory exists...
+    while IFS= read -r LINE; do
+        if [ "${LINE#worktree }" != "$LINE" ] && [ -d "${LINE#worktree }" ]; then
+            LIVE+="$(worktree_hash "${LINE#worktree }") "
+        fi
+    done <<< "$(git worktree list --porcelain)"
+
+    for NAME in $DATABASES; do
+        # A name may read both as a worktree database and as a _test_N one; any live hash keeps it.
+        HASHES=""
+        if [[ "$NAME" =~ ^sail_wt_[a-z0-9_]+_[0-9a-f]{8}$ ]]; then
+            HASHES+="${NAME: -8} "
+        fi
+        if [[ "$NAME" =~ ^(sail_wt_[a-z0-9_]+_[0-9a-f]{8})_test_[0-9]+$ ]]; then
+            HASHES+="${BASH_REMATCH[1]: -8} "
+        fi
+        if [ -z "$HASHES" ]; then
+            continue
+        fi
+
+        for HASH in $HASHES; do
+            if [[ "$LIVE" == *" $HASH "* ]]; then
+                continue 2
+            fi
+        done
+
+        case "$DB_CONNECTION" in
+            pgsql) pgsql_query "DROP DATABASE IF EXISTS \"$NAME\" WITH (FORCE)" > /dev/null || return 1 ;;
+            *) mysql_query "DROP DATABASE IF EXISTS \`$NAME\`" || return 1 ;;
+        esac
+        echo "Pruned worktree database: $NAME"
+    done
 }
 
 # Run SQL in the database service container as the configured user...
@@ -304,12 +392,22 @@ CONTAINER_ARGS=()
 
 case "$1" in
     worktree)
-        if [ "${2:-}" == "setup" ]; then
-            worktree_setup
-            exit
-        fi
-
-        worktree_fail "Usage: sail worktree setup"
+        case "${2:-}" in
+            setup)
+                worktree_setup
+                ;;
+            prune)
+                check_database_driver
+                if [ "$DB_CONNECTION" != "sqlite" ]; then
+                    resolve_sail_stack
+                    prune_worktree_databases
+                fi
+                ;;
+            *)
+                worktree_fail "Usage: sail worktree setup | sail worktree prune"
+                ;;
+        esac
+        exit
         ;;
     php|composer|cpx|node|npm|npx|pnpm|pnpx|yarn|bun|bunx)
         run_in_throwaway_container "$@"
