@@ -82,11 +82,45 @@ function sail_stack_not_running {
         "Start it there with: cd \"$MAIN_CHECKOUT\" && ./vendor/bin/sail up -d"
 }
 
+# Print the ID of a service's running container in the main checkout's Sail stack...
+function running_container {
+    local CONTAINER
+
+    CONTAINER="$(main_compose ps --status running -q "$1" 2> /dev/null)"
+
+    if [ -z "$CONTAINER" ]; then
+        sail_stack_not_running
+    fi
+
+    printf '%s' "$CONTAINER"
+}
+
+# Print the ID of the database service's running container...
+function database_container {
+    local DB_SERVICE
+
+    DB_SERVICE="$(main_env DB_HOST)"
+    if [ -z "$DB_SERVICE" ]; then
+        worktree_fail "The main checkout's env file sets no DB_HOST database service."
+    fi
+
+    running_container "$DB_SERVICE"
+}
+
+# Set ARGS to a docker subcommand with stdin attached, and a TTY only when stdin is a terminal and
+# NO_TTY is not set...
+function interactive_args {
+    ARGS=("$@" -i)
+    if [ -t 0 ] && [ -z "${NO_TTY:-}" ]; then
+        ARGS+=(-t)
+    fi
+}
+
 # Reads the app service from the main checkout's resolved compose configuration and checks that
 # its Sail stack runs. Sets APP_IMAGE, DB_CONTAINER and SERVICE_ARGS (the app service's networks,
 # environment and extra hosts as docker run arguments)...
 function resolve_sail_stack {
-    local CONFIG CACHE DB_SERVICE ARG PREVIOUS=""
+    local CONFIG CACHE ARG PREVIOUS=""
 
     CONFIG="$(main_compose config --format json 2> /dev/null)" || exit 1
 
@@ -107,16 +141,7 @@ function resolve_sail_stack {
         sail_stack_not_running
     fi
 
-    DB_SERVICE="$(main_env DB_HOST)"
-    if [ -z "$DB_SERVICE" ]; then
-        worktree_fail "The main checkout's env file sets no DB_HOST database service."
-    fi
-
-    DB_CONTAINER="$(main_compose ps --status running -q "$DB_SERVICE" 2> /dev/null)"
-
-    if [ -z "$DB_CONTAINER" ]; then
-        sail_stack_not_running
-    fi
+    DB_CONTAINER="$(database_container)" || exit 1
 
     # Parse the rest of the configuration with PHP inside the app image, so the host needs neither
     # jq nor PHP. The result is cached in the git common dir, keyed by the configuration.
@@ -152,17 +177,14 @@ function resolve_sail_stack {
     done < "$CACHE"
 }
 
-# Set ARGS to the docker arguments of a throwaway container, up to its image...
+# Set ARGS to the docker run arguments of a throwaway container, up to its image, with
+# CONTAINER_ARGS as extra arguments...
 function throwaway_container_args {
     resolve_sail_stack
 
-    ARGS=(run --rm -i)
-    if [ -t 0 ]; then
-        ARGS+=(-t)
-    fi
-
+    interactive_args run --rm
     ARGS+=("${SERVICE_ARGS[@]}")
-    ARGS+=(-e "WWWUSER=$WWWUSER")
+    ARGS+=(-e "WWWUSER=$WWWUSER" "${CONTAINER_ARGS[@]}")
     ARGS+=(-e "DB_DATABASE=$WORKTREE_DATABASE" -e "REDIS_PREFIX=${WORKTREE_DATABASE}_" -e "CACHE_PREFIX=${WORKTREE_DATABASE}_cache_")
     forward_agent_env
     if [ -n "${COLORTERM:-}" ]; then
@@ -183,6 +205,12 @@ function run_in_throwaway_container {
 function run_in_setup_container {
     throwaway_container_args
     "$SAIL_DOCKER_BINARY" "${ARGS[@]}" "$APP_IMAGE" "$@"
+}
+
+# Run a command in a running service container of the main checkout's Sail stack...
+function exec_in_container {
+    interactive_args exec
+    exec "$SAIL_DOCKER_BINARY" "${ARGS[@]}" "$@"
 }
 
 # Copy a directory, with reflinks where the filesystem supports them...
@@ -292,6 +320,8 @@ function pgsql_query {
     "$SAIL_DOCKER_BINARY" exec -i "$DB_CONTAINER" sh -c 'psql -v ON_ERROR_STOP=1 -qtA -U "$POSTGRES_USER" -d postgres' <<< "$1"
 }
 
+CONTAINER_ARGS=()
+
 case "$1" in
     worktree)
         if [ "${2:-}" == "setup" ]; then
@@ -301,12 +331,50 @@ case "$1" in
 
         worktree_fail "Usage: sail worktree setup"
         ;;
-    php|composer)
+    php|composer|cpx|node|npm|npx|pnpm|pnpx|yarn|bun|bunx)
         run_in_throwaway_container "$@"
         ;;
-    artisan)
+    artisan|art|a)
         shift 1
+        if [ "${1:-}" == "schedule:run" ]; then
+            NO_TTY=yes
+        fi
         run_in_throwaway_container php artisan "$@"
+        ;;
+    debug)
+        shift 1
+        CONTAINER_ARGS=(-e XDEBUG_TRIGGER=1)
+        run_in_throwaway_container php artisan "$@"
+        ;;
+    phpunit|pest|pint)
+        run_in_throwaway_container php "vendor/bin/$1" "${@:2}"
+        ;;
+    tinker)
+        shift 1
+        run_in_throwaway_container php artisan tinker "$@"
+        ;;
+    shell|bash)
+        shift 1
+        run_in_throwaway_container bash "$@"
+        ;;
+    root-shell|root-bash)
+        shift 1
+        CONTAINER_ARGS=(-e SUPERVISOR_PHP_USER=root)
+        run_in_throwaway_container bash "$@"
+        ;;
+    psql)
+        shift 1
+        CONTAINER="$(database_container)" || exit 1
+        exec_in_container "$CONTAINER" bash -c "PGPASSWORD=\${PGPASSWORD} psql -U \${POSTGRES_USER} $WORKTREE_DATABASE" "$@"
+        ;;
+    redis|valkey)
+        CONTAINER="$(running_container "$1")" || exit 1
+        exec_in_container "$CONTAINER" "$1-cli" "${@:2}"
+        ;;
+    mongodb)
+        shift 1
+        CONTAINER="$(running_container mongodb)" || exit 1
+        exec_in_container "$CONTAINER" mongosh --port 27017 --username "$MONGODB_USERNAME" --password "$MONGODB_PASSWORD" --authenticationDatabase admin "$@"
         ;;
     test)
         shift 1
