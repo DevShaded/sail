@@ -255,6 +255,27 @@ pass "composer and bin run in the throwaway container"
 cmp -s "$APP/.env" .env || fail "the copied .env is not rewritten"
 pass "the copied .env is not rewritten"
 
+# --- Command surface (#4) ---
+[ "$(vendor/bin/sail art --version)" == "$(vendor/bin/sail a --version)" ] || fail "artisan aliases run artisan"
+vendor/bin/sail phpunit --version > /dev/null
+vendor/bin/sail tinker --execute 'echo "tinker-ok";' | grep -qx tinker-ok || fail "tinker runs in the throwaway container"
+[ "$(vendor/bin/sail debug tinker --execute 'echo getenv("XDEBUG_TRIGGER");')" == "1" ] || fail "debug sets XDEBUG_TRIGGER"
+vendor/bin/sail node --version > /dev/null
+vendor/bin/sail npm --version > /dev/null
+pass "artisan aliases, phpunit, tinker, debug, node and npm run in the throwaway container"
+
+[ "$(echo 'id -un' | vendor/bin/sail shell)" == "sail" ] || fail "shell runs as sail with piped input"
+[ "$(echo 'id -un' | vendor/bin/sail root-shell)" == "root" ] || fail "root-shell runs as root"
+pass "shells take piped input; shell runs as sail, root-shell as root"
+
+echo 'SELECT current_database();' | vendor/bin/sail psql | grep -qF "$WORKTREE_DATABASE" || fail "psql connects to the worktree database"
+pass "psql connects to the worktree database"
+
+for COMMAND in down share dusk; do
+    expect_failure "'sail $COMMAND' is refused, naming the main checkout" "$APP" vendor/bin/sail "$COMMAND"
+done
+# --- End command surface (#4) ---
+
 expect_failure "unknown commands are refused" "$APP" vendor/bin/sail up -d
 
 echo "# Unsupported layouts"
