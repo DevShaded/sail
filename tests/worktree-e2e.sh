@@ -164,6 +164,98 @@ MAIN_DATABASE_STATE="$(main_database_state)"
 
 expect_failure "worktree setup refused in the main checkout" "main checkout" vendor/bin/sail worktree setup
 
+echo "# Composer plugin: post-checkout hook"
+HOOK="$APP/.git/hooks/post-checkout"
+HOOK_START="# >>> laravel/sail worktree setup >>>"
+
+function managed_blocks {
+    grep -cxF -- "$HOOK_START" "$1" || true
+}
+
+# A pre-existing shell hook, which must keep its content and still run...
+printf '#!/bin/sh\necho "pre-existing hook ran" >> "%s"\n' "$WORK/chain.log" > "$HOOK"
+chmod +x "$HOOK"
+cp "$HOOK" "$WORK/hook.orig"
+
+OUTPUT="$(composer install --no-interaction 2>&1)" || fail "non-interactive install without allow-plugins: $OUTPUT"
+cmp -s "$HOOK" "$WORK/hook.orig" || fail "the plugin writes no hook unless allowed"
+pass "non-interactive install without allow-plugins completes and writes no hook"
+
+composer config allow-plugins.laravel/sail true
+composer install --no-interaction --quiet
+[ -x "$HOOK" ] || fail "install leaves the hook executable"
+[ "$(managed_blocks "$HOOK")" == "1" ] || fail "install writes one managed block"
+grep -qF "pre-existing hook ran" "$HOOK" || fail "install keeps the existing hook's content"
+composer install --no-interaction --quiet
+composer update laravel/sail --no-interaction --quiet
+[ "$(managed_blocks "$HOOK")" == "1" ] || fail "a second install or update leaves one managed block"
+pass "install and update keep one managed block in the existing shell hook"
+
+printf '#!/usr/bin/env python3\nprint("python hook")\n' > "$HOOK"
+cp "$HOOK" "$WORK/hook.python"
+OUTPUT="$(composer install --no-interaction 2>&1)"
+cmp -s "$HOOK" "$WORK/hook.python" || fail "a non-shell hook is left untouched"
+grep -qF "post-checkout" <<< "$OUTPUT" || fail "a non-shell hook gives a warning, got: $OUTPUT"
+pass "a non-shell hook is left untouched, with a warning"
+
+rm "$HOOK"
+git config core.hooksPath .githooks
+OUTPUT="$(composer install --no-interaction 2>&1)"
+[ ! -e "$HOOK" ] && [ ! -e .githooks ] || fail "nothing is written when core.hooksPath is set"
+[ "$(git config core.hooksPath)" == ".githooks" ] || fail "core.hooksPath is unchanged"
+grep -qF "core.hooksPath" <<< "$OUTPUT" || fail "core.hooksPath gives a warning, got: $OUTPUT"
+git config --unset core.hooksPath
+pass "with core.hooksPath set, nothing is written, with a warning"
+
+# Composer in the main checkout's Sail container writes the hook the host then uses...
+cp "$WORK/hook.orig" "$HOOK"
+vendor/bin/sail composer install --no-interaction --quiet
+[ "$(managed_blocks "$HOOK")" == "1" ] || fail "composer in the Sail container writes the managed block"
+grep -qF -e "$APP" -e /var/www/html "$HOOK" && fail "the hook contains no absolute project path"
+pass "composer in the Sail container writes a hook without absolute project paths"
+
+: > "$WORK/chain.log"
+HOOKED="$WORK/hooked-wt"
+git worktree add -q -b hooked-wt "$HOOKED"
+grep -qF "pre-existing hook ran" "$WORK/chain.log" || fail "the existing hook still runs"
+(
+    cd "$HOOKED"
+    vendor/bin/sail test > /dev/null || fail "sail test passes in a linked worktree created by git worktree add"
+)
+pass "git worktree add sets up the linked worktree: sail test passes, existing hook still runs"
+
+(
+    cd "$HOOKED"
+    mv "$HOOK" "$WORK/hook.saved"
+    vendor/bin/sail composer install --no-interaction --quiet
+    [ ! -e "$HOOK" ] || fail "composer in a linked worktree's throwaway container writes no hook"
+    mv "$WORK/hook.saved" "$HOOK"
+
+    rm .env
+    git checkout -q -b hooked-wt-switch
+    [ ! -e .env ] || fail "a branch switch in a linked worktree triggers worktree setup"
+    cp "$APP/.env" .env
+)
+OUTPUT="$(git checkout -b main-switch 2>&1 && git checkout main 2>&1)" || fail "branch switches in the main checkout: $OUTPUT"
+grep -qi "worktree setup" <<< "$OUTPUT" && fail "a branch switch in the main checkout triggers worktree setup: $OUTPUT"
+OUTPUT="$(git clone -q "$APP" "$WORK/clone" 2>&1)" || fail "git clone: $OUTPUT"
+grep -qi "worktree setup" <<< "$OUTPUT" && fail "git clone triggers worktree setup: $OUTPUT"
+pass "composer in a linked worktree writes no hook; checkouts, clones and branch switches skip setup"
+
+OUTPUT="$(SAIL_DOCKER_BINARY=false git worktree add -b failing-wt "$WORK/failing-wt" 2>&1)" \
+    || fail "git worktree add exits 0 when worktree setup fails: $OUTPUT"
+grep -qF "worktree setup failed" <<< "$OUTPUT" || fail "a failed worktree setup is printed, got: $OUTPUT"
+pass "git worktree add exits 0 when worktree setup fails, and prints the failure"
+
+composer remove laravel/sail --dev --no-interaction --quiet
+[ "$(managed_blocks "$HOOK")" == "0" ] || fail "removing the package removes the managed block"
+grep -qF "pre-existing hook ran" "$HOOK" || fail "removing the package keeps the rest of the hook"
+pass "removing the package removes the managed block and keeps the rest of the hook"
+# composer remove also drops the allow-plugins entry...
+composer config allow-plugins.laravel/sail true
+composer require laravel/sail:* --dev --no-interaction --quiet
+[ "$(managed_blocks "$HOOK")" == "1" ] || fail "requiring the package again writes the managed block"
+
 # Linked worktree commands must not need php or jq on the host.
 mkdir "$WORK/no-host-tools"
 for TOOL in php jq; do
@@ -247,6 +339,29 @@ pass "composer and bin run in the throwaway container"
 
 cmp -s "$APP/.env" .env || fail "the copied .env is not rewritten"
 pass "the copied .env is not rewritten"
+
+# --- Command surface (#4) ---
+[ "$(vendor/bin/sail art --version)" == "$(vendor/bin/sail a --version)" ] || fail "artisan aliases run artisan"
+vendor/bin/sail phpunit --version > /dev/null
+vendor/bin/sail tinker --execute 'echo "tinker-ok";' | grep -qx tinker-ok || fail "tinker runs in the throwaway container"
+[ "$(vendor/bin/sail debug tinker --execute 'echo getenv("XDEBUG_TRIGGER");')" == "1" ] || fail "debug sets XDEBUG_TRIGGER"
+vendor/bin/sail node --version > /dev/null
+vendor/bin/sail npm --version > /dev/null
+pass "artisan aliases, phpunit, tinker, debug, node and npm run in the throwaway container"
+
+[ "$(echo 'id -un' | vendor/bin/sail shell)" == "sail" ] || fail "shell runs as sail with piped input"
+[ "$(echo 'id -un' | vendor/bin/sail root-shell)" == "root" ] || fail "root-shell runs as root"
+pass "shells take piped input; shell runs as sail, root-shell as root"
+
+if [ "$DB" == "pgsql" ]; then
+    echo 'SELECT current_database();' | vendor/bin/sail psql | grep -qF "$WORKTREE_DATABASE" || fail "psql connects to the worktree database"
+    pass "psql connects to the worktree database"
+fi
+
+for COMMAND in down share dusk; do
+    expect_failure "'sail $COMMAND' is refused, naming the main checkout" "$APP" vendor/bin/sail "$COMMAND"
+done
+# --- End command surface (#4) ---
 
 expect_failure "unknown commands are refused" "$APP" vendor/bin/sail up -d
 
