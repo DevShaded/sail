@@ -192,10 +192,12 @@ function setup_output {
     "$2" worktree setup > "$WORK/$1.out" 2>&1 || { cat "$WORK/$1.out" >&2; return 1; }
 }
 
-# host_composer <args...>: changes a lockfile with the host's composer, which reaches the path
-# repository of this copy of Sail. Linked worktree commands never use it.
-function host_composer {
-    PATH="${PATH#"$WORK/no-host-tools:"}" composer "$@" --no-install --no-scripts --no-interaction --quiet
+# drop_dev_package <package>: drops a dev package from composer.json and composer.lock, not from
+# vendor, with the host's composer, which reaches the path repository of this copy of Sail.
+# Linked worktree commands never use it.
+function drop_dev_package {
+    PATH="${PATH#"$WORK/no-host-tools:"}" composer remove --dev "$1" --no-update --no-interaction --quiet
+    PATH="${PATH#"$WORK/no-host-tools:"}" composer update "$1" --no-install --no-scripts --no-interaction --quiet
 }
 
 cd "$APP"
@@ -216,7 +218,7 @@ file_put_contents('after-setup.marker', (is_dir('vendor/laravel/pint') ? 'pint-p
 EOF
 printf 'after-setup.marker\nafter-setup.fail\n' >> .gitignore
 vendor/bin/sail composer config scripts.sail-worktree-setup "@php after-setup.php"
-host_composer remove --dev laravel/pint
+drop_dev_package laravel/pint
 [ -d vendor/laravel/pint ] || fail "composer remove --no-install keeps the installed package"
 git add -A
 git commit -q -m "Drop pint, add an after-setup step"
@@ -244,7 +246,7 @@ pass "commands still run after a failing after-setup step"
 rm after-setup.fail
 
 cd "$APP"
-git worktree add -q "$WORK/wt-branch" wt-deps
+git worktree add -q -b wt-branch "$WORK/wt-branch" wt-deps
 cd "$WORK/wt-branch"
 setup_output branch "$APP/vendor/bin/sail" || fail "setup in wt-branch"
 grep -qF "composer install" "$WORK/branch.out" || fail "a changed composer.lock runs composer install"
@@ -275,7 +277,7 @@ cd "$APP"
 git worktree add -q -b wt-no-vendor "$WORK/wt-no-vendor"
 cd "$WORK/wt-no-vendor"
 # The container cannot reach Sail's path repository, so this branch installs only from Packagist.
-host_composer remove --dev laravel/sail
+drop_dev_package laravel/sail
 mv "$APP/vendor" "$WORK/main-vendor"
 setup_output no-vendor "$SAIL_REPO/bin/sail" || { mv "$WORK/main-vendor" "$APP/vendor"; fail "setup with no vendor in the main checkout"; }
 mv "$WORK/main-vendor" "$APP/vendor"
