@@ -11,7 +11,8 @@ use Composer\Util\ProcessExecutor;
 
 /**
  * Keeps a managed block in the main checkout's post-checkout hook that runs worktree setup when
- * "git worktree add" creates a linked worktree.
+ * "git worktree add" creates a linked worktree, and appends the agent notes to the main checkout's
+ * CLAUDE.md and AGENTS.md.
  */
 class WorktreePlugin implements PluginInterface, EventSubscriberInterface
 {
@@ -45,6 +46,26 @@ esac
 
 SH;
 
+    const NOTES_START = '<!-- sail-worktree:start -->';
+
+    /**
+     * The agent notes, appended to an existing CLAUDE.md and AGENTS.md in the main checkout.
+     */
+    const NOTES = <<<'MD'
+<!-- sail-worktree:start -->
+## Sail in git worktrees
+
+- In a linked worktree, run `vendor/bin/sail` as usual. Each command runs in a throwaway container with this worktree's own database. Database server, Redis and Mailpit are shared with the main checkout.
+- The Sail stack runs in the main checkout only. Never run `sail up`, `down`, `stop` or `build` in a linked worktree.
+- App and tests share one database per worktree: running tests wipes it.
+- No HTTP server, Vite dev server or Dusk in a linked worktree.
+- After a lockfile change, run `vendor/bin/sail worktree setup`.
+- If `vendor/bin/sail` is missing in a linked worktree, run from inside it:
+  `"$(git worktree list --porcelain | sed -n '1s/^worktree //p')/vendor/bin/sail" worktree setup`
+<!-- sail-worktree:end -->
+
+MD;
+
     /**
      * @var \Composer\IO\IOInterface
      */
@@ -64,25 +85,32 @@ SH;
     {
         $this->io = $io;
 
-        $this->updateHook(false);
+        if ($this->inMainCheckout()) {
+            $this->updateHook(false);
+        }
     }
 
     public static function getSubscribedEvents()
     {
         return [
-            ScriptEvents::POST_INSTALL_CMD => 'installHook',
-            ScriptEvents::POST_UPDATE_CMD => 'installHook',
+            ScriptEvents::POST_INSTALL_CMD => 'install',
+            ScriptEvents::POST_UPDATE_CMD => 'install',
         ];
     }
 
     /**
-     * Write the managed block into the main checkout's post-checkout hook.
+     * Write the managed block into the main checkout's post-checkout hook and add the agent notes.
      *
      * @return void
      */
-    public function installHook()
+    public function install()
     {
+        if (! $this->inMainCheckout()) {
+            return;
+        }
+
         $this->updateHook(true);
+        $this->addAgentNotes();
     }
 
     /**
@@ -94,12 +122,6 @@ SH;
     protected function updateHook($install)
     {
         $root = getcwd();
-
-        // Only a main checkout has a .git directory: a linked worktree, also inside a throwaway
-        // container, has a .git file...
-        if (! is_dir($root.'/.git')) {
-            return;
-        }
 
         if ((new ProcessExecutor($this->io))->execute('git -C '.ProcessExecutor::escape($root).' config --get core.hooksPath', $hooksPath) === 0
             && trim($hooksPath) !== '') {
@@ -143,6 +165,40 @@ SH;
         file_put_contents($temporary, $content);
         chmod($temporary, $current === null ? 0755 : fileperms($hook) & 0777);
         rename($temporary, $hook);
+    }
+
+    /**
+     * Append the agent notes to CLAUDE.md and AGENTS.md where the file exists and lacks them.
+     *
+     * @return void
+     */
+    protected function addAgentNotes()
+    {
+        foreach (['CLAUDE.md', 'AGENTS.md'] as $name) {
+            $file = getcwd().'/'.$name;
+
+            // Read again for each file, so a CLAUDE.md that links to AGENTS.md gets the notes once...
+            $current = is_file($file) ? file_get_contents($file) : false;
+
+            if ($current === false || strpos($current, self::NOTES_START) !== false) {
+                continue;
+            }
+
+            $separator = $current === '' ? '' : (substr($current, -1) === "\n" ? "\n" : "\n\n");
+
+            file_put_contents($file, $separator.self::NOTES, FILE_APPEND);
+        }
+    }
+
+    /**
+     * Only a main checkout has a .git directory: a linked worktree, also inside a throwaway
+     * container, has a .git file.
+     *
+     * @return bool
+     */
+    protected function inMainCheckout()
+    {
+        return is_dir(getcwd().'/.git');
     }
 
     /**

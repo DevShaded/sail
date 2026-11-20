@@ -189,6 +189,64 @@ OUTPUT="$(git clone -q "$APP" "$WORK/clone" 2>&1)" || fail "git clone: $OUTPUT"
 grep -qi "worktree setup" <<< "$OUTPUT" && fail "git clone triggers worktree setup: $OUTPUT"
 pass "composer in a linked worktree writes no hook; checkouts, clones and branch switches skip setup"
 
+# --- Agent notes (#10) ---
+cat > "$WORK/notes.expected" << 'EOF'
+<!-- sail-worktree:start -->
+## Sail in git worktrees
+
+- In a linked worktree, run `vendor/bin/sail` as usual. Each command runs in a throwaway container with this worktree's own database. Database server, Redis and Mailpit are shared with the main checkout.
+- The Sail stack runs in the main checkout only. Never run `sail up`, `down`, `stop` or `build` in a linked worktree.
+- App and tests share one database per worktree: running tests wipes it.
+- No HTTP server, Vite dev server or Dusk in a linked worktree.
+- After a lockfile change, run `vendor/bin/sail worktree setup`.
+- If `vendor/bin/sail` is missing in a linked worktree, run from inside it:
+  `"$(git worktree list --porcelain | sed -n '1s/^worktree //p')/vendor/bin/sail" worktree setup`
+<!-- sail-worktree:end -->
+EOF
+
+# notes_ok <file> <original content file>: the file is its original content plus the notes block once.
+function notes_ok {
+    [ "$(grep -cxF -- '<!-- sail-worktree:start -->' "$1")" == "1" ] || fail "$1 holds the notes block once"
+    sed -n '/^<!-- sail-worktree:start -->$/,/^<!-- sail-worktree:end -->$/p' "$1" | cmp -s - "$WORK/notes.expected" \
+        || fail "$1 holds the approved notes wording"
+    head -c "$(wc -c < "$2")" "$1" | cmp -s - "$2" || fail "$1 keeps its own content"
+}
+
+printf '# Project notes\n\nKeep this line.\n' > CLAUDE.md
+printf '# Agents\n\nNo trailing newline.' > AGENTS.md
+cp CLAUDE.md "$WORK/claude.orig"
+cp AGENTS.md "$WORK/agents.orig"
+composer install --no-interaction --quiet
+composer install --no-interaction --quiet
+notes_ok CLAUDE.md "$WORK/claude.orig"
+notes_ok AGENTS.md "$WORK/agents.orig"
+cp CLAUDE.md "$WORK/claude.noted"
+vendor/bin/sail composer install --no-interaction --quiet
+cmp -s CLAUDE.md "$WORK/claude.noted" || fail "a later install leaves CLAUDE.md unchanged"
+pass "two installs add the notes block once to existing CLAUDE.md and AGENTS.md"
+
+cp "$WORK/claude.orig" CLAUDE.md
+rm AGENTS.md
+composer install --no-interaction --quiet
+notes_ok CLAUDE.md "$WORK/claude.orig"
+[ ! -e AGENTS.md ] || fail "a missing AGENTS.md is not created"
+rm CLAUDE.md
+composer install --no-interaction --quiet
+[ ! -e CLAUDE.md ] || fail "a missing CLAUDE.md is not created"
+pass "a deleted notes block returns; missing CLAUDE.md and AGENTS.md are not created"
+
+(
+    cd "$HOOKED"
+    cp "$WORK/claude.orig" CLAUDE.md
+    cp "$WORK/agents.orig" AGENTS.md
+    vendor/bin/sail composer install --no-interaction --quiet
+    cmp -s CLAUDE.md "$WORK/claude.orig" || fail "composer in a linked worktree writes no notes to CLAUDE.md"
+    cmp -s AGENTS.md "$WORK/agents.orig" || fail "composer in a linked worktree writes no notes to AGENTS.md"
+    rm CLAUDE.md AGENTS.md
+)
+pass "composer in a linked worktree writes no notes"
+# --- End agent notes (#10) ---
+
 OUTPUT="$(SAIL_DOCKER_BINARY=false git worktree add -b failing-wt "$WORK/failing-wt" 2>&1)" \
     || fail "git worktree add exits 0 when worktree setup fails: $OUTPUT"
 grep -qF "worktree setup failed" <<< "$OUTPUT" || fail "a failed worktree setup is printed, got: $OUTPUT"
