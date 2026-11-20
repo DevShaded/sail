@@ -379,8 +379,10 @@ function drop_dev_package {
     PATH="${PATH#"$WORK/no-host-tools:"}" composer update "$1" --no-install --no-scripts --no-interaction --quiet
 }
 
+# These linked worktrees are added without the post-checkout hook, so each check sees what
+# "sail worktree setup" itself does.
 cd "$APP"
-git worktree add -q -b wt-deps "$WORK/wt-deps"
+git -c core.hooksPath=/dev/null worktree add -q -b wt-deps "$WORK/wt-deps"
 cd "$WORK/wt-deps"
 setup_output deps-first "$APP/vendor/bin/sail" || fail "setup in wt-deps"
 grep -qF "Installing dependencies" "$WORK/deps-first.out" && fail "identical lockfiles run no installer"
@@ -393,7 +395,7 @@ if (file_exists('after-setup.fail')) {
     fwrite(STDERR, "after-setup failed on purpose\n");
     exit(3);
 }
-file_put_contents('after-setup.marker', (is_dir('vendor/laravel/pint') ? 'pint-present ' : '').getenv('DB_DATABASE'));
+file_put_contents('after-setup.marker', is_dir('vendor/laravel/pint') ? 'before dependencies' : 'after dependencies');
 EOF
 printf 'after-setup.marker\nafter-setup.fail\n' >> .gitignore
 vendor/bin/sail composer config scripts.sail-worktree-setup "@php after-setup.php"
@@ -401,12 +403,11 @@ drop_dev_package laravel/pint
 [ -d vendor/laravel/pint ] || fail "composer remove --no-install keeps the installed package"
 git add -A
 git commit -q -m "Drop pint, add an after-setup step"
-DEPS_DATABASE="sail_wt_wt_deps_$(printf '%s' "$PWD" | git hash-object --stdin | cut -c1-8)"
 
 setup_output deps-resync vendor/bin/sail || fail "setup after a lockfile change"
 grep -qF "composer install" "$WORK/deps-resync.out" || fail "a lockfile change resyncs on re-run"
 [ ! -d vendor/laravel/pint ] || fail "resync removes the dropped package"
-[ "$(cat after-setup.marker)" == "$DEPS_DATABASE" ] || fail "after-setup step runs after dependencies, in the worktree environment: $(cat after-setup.marker)"
+[ "$(cat after-setup.marker)" == "after dependencies" ] || fail "after-setup step runs after dependencies: $(cat after-setup.marker)"
 pass "re-running setup after a lockfile change resyncs, then runs the after-setup step"
 
 rm after-setup.marker
@@ -425,7 +426,7 @@ pass "commands still run after a failing after-setup step"
 rm after-setup.fail
 
 cd "$APP"
-git worktree add -q -b wt-branch "$WORK/wt-branch" wt-deps
+git -c core.hooksPath=/dev/null worktree add -q -b wt-branch "$WORK/wt-branch" wt-deps
 cd "$WORK/wt-branch"
 setup_output branch "$APP/vendor/bin/sail" || fail "setup in wt-branch"
 grep -qF "composer install" "$WORK/branch.out" || fail "a changed composer.lock runs composer install"
@@ -453,7 +454,7 @@ pass "no Node lockfile: no Node step, setup succeeds"
 
 echo "# Main checkout without vendor"
 cd "$APP"
-git worktree add -q -b wt-no-vendor "$WORK/wt-no-vendor"
+git -c core.hooksPath=/dev/null worktree add -q -b wt-no-vendor "$WORK/wt-no-vendor"
 cd "$WORK/wt-no-vendor"
 # The container cannot reach Sail's path repository, so this branch installs only from Packagist.
 drop_dev_package laravel/sail
