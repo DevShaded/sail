@@ -71,6 +71,7 @@ function main_env {
 
 # The linked worktree may have no env file yet, so the app service comes from the main checkout...
 APP_SERVICE="$(main_env APP_SERVICE)"
+DB_CONNECTION="$(main_env DB_CONNECTION)"
 
 # Run Docker Compose for the main checkout...
 function main_compose {
@@ -107,15 +108,18 @@ function resolve_sail_stack {
         sail_stack_not_running
     fi
 
-    DB_SERVICE="$(main_env DB_HOST)"
-    if [ -z "$DB_SERVICE" ]; then
-        worktree_fail "The main checkout's env file sets no DB_HOST database service."
-    fi
+    # On sqlite, the Sail stack has no database service...
+    if [ "$DB_CONNECTION" != "sqlite" ]; then
+        DB_SERVICE="$(main_env DB_HOST)"
+        if [ -z "$DB_SERVICE" ]; then
+            worktree_fail "The main checkout's env file sets no DB_HOST database service."
+        fi
 
-    DB_CONTAINER="$(main_compose ps --status running -q "$DB_SERVICE" 2> /dev/null)"
+        DB_CONTAINER="$(main_compose ps --status running -q "$DB_SERVICE" 2> /dev/null)"
 
-    if [ -z "$DB_CONTAINER" ]; then
-        sail_stack_not_running
+        if [ -z "$DB_CONTAINER" ]; then
+            sail_stack_not_running
+        fi
     fi
 
     # Parse the rest of the configuration with PHP inside the app image, so the host needs neither
@@ -163,7 +167,10 @@ function run_in_throwaway_container {
 
     ARGS+=("${SERVICE_ARGS[@]}")
     ARGS+=(-e "WWWUSER=$WWWUSER")
-    ARGS+=(-e "DB_DATABASE=$WORKTREE_DATABASE" -e "REDIS_PREFIX=${WORKTREE_DATABASE}_" -e "CACHE_PREFIX=${WORKTREE_DATABASE}_cache_")
+    if [ "$DB_CONNECTION" != "sqlite" ]; then
+        ARGS+=(-e "DB_DATABASE=$WORKTREE_DATABASE")
+    fi
+    ARGS+=(-e "REDIS_PREFIX=${WORKTREE_DATABASE}_" -e "CACHE_PREFIX=${WORKTREE_DATABASE}_cache_")
     forward_agent_env
     if [ -n "${COLORTERM:-}" ]; then
         ARGS+=(-e "COLORTERM=$COLORTERM")
@@ -185,7 +192,7 @@ function copy_tree {
 }
 
 function worktree_setup {
-    local FILE DIR DB_CONNECTION
+    local FILE DIR
 
     for FILE in "$MAIN_CHECKOUT"/.env* "$MAIN_CHECKOUT/auth.json"; do
         if [ -f "$FILE" ] && [ ! -e "$WORKTREE_DIR/${FILE##*/}" ]; then
@@ -199,16 +206,18 @@ function worktree_setup {
         fi
     done
 
-    DB_CONNECTION="$(main_env DB_CONNECTION)"
-    if [ "$DB_CONNECTION" != "pgsql" ]; then
-        worktree_fail "Worktree setup does not support the database driver '$DB_CONNECTION'."
-    fi
+    case "$DB_CONNECTION" in
+        pgsql|mysql|mariadb|sqlite) ;;
+        *) worktree_fail "Worktree setup does not support the database driver '$DB_CONNECTION'." ;;
+    esac
 
     resolve_sail_stack
 
-    if [ "$(pgsql_query "SELECT 1 FROM pg_database WHERE datname = '$WORKTREE_DATABASE'")" != "1" ]; then
-        pgsql_query "CREATE DATABASE \"$WORKTREE_DATABASE\"" > /dev/null || exit 1
-    fi
+    case "$DB_CONNECTION" in
+        pgsql) pgsql_create_database ;;
+        mysql|mariadb) mysql_create_database ;;
+        sqlite) sqlite_create_database; return ;;
+    esac
 
     echo "${GREEN}Worktree setup complete.${NC} Worktree database: $WORKTREE_DATABASE"
 }
@@ -217,6 +226,67 @@ function worktree_setup {
 function pgsql_query {
     # shellcheck disable=SC2016
     "$SAIL_DOCKER_BINARY" exec -i "$DB_CONTAINER" sh -c 'psql -v ON_ERROR_STOP=1 -qtA -U "$POSTGRES_USER" -d postgres' <<< "$1"
+}
+
+function pgsql_create_database {
+    if [ "$(pgsql_query "SELECT 1 FROM pg_database WHERE datname = '$WORKTREE_DATABASE'")" != "1" ]; then
+        pgsql_query "CREATE DATABASE \"$WORKTREE_DATABASE\"" > /dev/null || exit 1
+    fi
+}
+
+# Run SQL in the database service container as root, with the mariadb client where the image has
+# one (a mariadb service may run under DB_CONNECTION=mysql)...
+function mysql_query {
+    # shellcheck disable=SC2016
+    "$SAIL_DOCKER_BINARY" exec -i "$DB_CONTAINER" sh -c '
+        CLIENT=mysql
+        command -v mariadb > /dev/null && CLIENT=mariadb
+        MYSQL_PWD="$MYSQL_ROOT_PASSWORD" exec "$CLIENT" -u root -N -B
+    ' <<< "$1"
+}
+
+# Create the worktree database as root, and grant the application user the worktree database name
+# pattern, so the application can create its own _test_N databases...
+function mysql_create_database {
+    mysql_query "CREATE DATABASE IF NOT EXISTS \`$WORKTREE_DATABASE\`;
+        GRANT ALL PRIVILEGES ON \`sail\\_wt\\_%\`.* TO '$(main_env DB_USERNAME)'@'%';" || exit 1
+}
+
+# The sqlite database file stays inside the linked worktree, where Laravel resolves the default or
+# a relative or container path...
+function sqlite_create_database {
+    local FILE
+
+    FILE="$(main_env DB_DATABASE)"
+    FILE="${FILE:-database/database.sqlite}"
+    FILE="${FILE#/var/www/html/}"
+
+    if [ "${FILE:0:1}" == "/" ]; then
+        worktree_fail "The sqlite database '$FILE' is outside the linked worktree." \
+            "Leave DB_DATABASE unset, or set it to a path inside the application."
+    fi
+
+    if [ ! -e "$WORKTREE_DIR/$FILE" ]; then
+        touch "$WORKTREE_DIR/$FILE" || exit 1
+    fi
+
+    echo "${GREEN}Worktree setup complete.${NC} Worktree database file: $FILE"
+}
+
+# Open the worktree database with the mysql or mariadb client in the database service container...
+function mysql_client {
+    local CLIENT="$1"
+
+    resolve_sail_stack
+
+    ARGS=(exec -i)
+    if [ -t 0 ]; then
+        ARGS+=(-t)
+    fi
+
+    # shellcheck disable=SC2016
+    exec "$SAIL_DOCKER_BINARY" "${ARGS[@]}" "$DB_CONTAINER" sh -c 'MYSQL_PWD="$MYSQL_PASSWORD" exec "$0" -u "$MYSQL_USER" $MYSQL_EXTRA_OPTIONS "$@"' \
+        "$CLIENT" "$WORKTREE_DATABASE" "${@:2}"
 }
 
 case "$1" in
@@ -246,6 +316,9 @@ case "$1" in
     run)
         shift 1
         run_in_throwaway_container "$@"
+        ;;
+    mysql|mariadb)
+        mysql_client "$@"
         ;;
     *)
         worktree_fail "'sail $1' is not available in a linked worktree." \

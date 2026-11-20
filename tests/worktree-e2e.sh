@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end test for Sail in linked git worktrees, on pgsql.
+# End-to-end test for Sail in linked git worktrees, on pgsql, mysql, mariadb or sqlite.
 #
 # Creates a fresh Laravel application that keeps this copy of Sail installed, makes it a git
 # repository, starts its Sail stack in the main checkout and drives real git, docker and sail
@@ -10,13 +10,15 @@
 #
 # Needs git, docker, php and composer on the host (php and composer only to create the
 # application; the linked worktree commands run with php and jq hidden from PATH).
-# SAIL_E2E_PHP (default 8.5) and SAIL_E2E_LARAVEL (default 12.x) choose the application.
+# SAIL_E2E_PHP (default 8.5) and SAIL_E2E_LARAVEL (default 12.x) choose the application,
+# SAIL_E2E_DB (default pgsql) its database: pgsql, mysql, mariadb or sqlite.
 # Host ports are picked by Docker, so runs never collide with other stacks.
 set -euo pipefail
 
 SAIL_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 PHP_VERSION="${SAIL_E2E_PHP:-8.5}"
 LARAVEL_VERSION="${SAIL_E2E_LARAVEL:-12.x}"
+DB="${SAIL_E2E_DB:-pgsql}"
 WORK="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/sail-e2e.XXXXXX")" && pwd -P)"
 APP="$WORK/app"
 PROJECT="sail-e2e-$(printf '%s' "${WORK##*.}" | tr '[:upper:]' '[:lower:]')"
@@ -53,45 +55,96 @@ function expect_failure {
     pass "$1"
 }
 
-# psql_query <database> <sql>: runs a query against the main checkout's database service.
-function psql_query {
-    (cd "$APP" && docker compose exec -T database psql -U sail -d "$1" -tAc "$2")
+# db_query <database> <sql>: runs a query against the main checkout's database service.
+function db_query {
+    if [ "$DB" == "pgsql" ]; then
+        (cd "$APP" && docker compose exec -T database psql -U sail -d "$1" -tAc "$2")
+    else
+        (cd "$APP" && docker compose exec -T -e MYSQL_PWD=password database "$DB" -u root -N -B -e "$2" "$1")
+    fi
 }
 
 function database_exists {
-    [ "$(psql_query postgres "SELECT 1 FROM pg_database WHERE datname = '$1'")" == "1" ]
+    if [ "$DB" == "pgsql" ]; then
+        [ "$(db_query postgres "SELECT 1 FROM pg_database WHERE datname = '$1'")" == "1" ]
+    else
+        [ "$(db_query information_schema "SELECT 1 FROM schemata WHERE schema_name = '$1'")" == "1" ]
+    fi
 }
 
 function table_exists {
-    [ "$(psql_query "$1" "SELECT to_regclass('public.$2') IS NOT NULL")" == "t" ]
+    if [ "$DB" == "pgsql" ]; then
+        [ "$(db_query "$1" "SELECT to_regclass('public.$2') IS NOT NULL")" == "t" ]
+    else
+        [ "$(db_query information_schema "SELECT count(*) FROM tables WHERE table_schema = '$1' AND table_name = '$2'")" == "1" ]
+    fi
+}
+
+# A fingerprint of the main checkout's database...
+function main_database_state {
+    if [ "$DB" == "sqlite" ]; then
+        cksum < "$APP/database/database.sqlite"
+    else
+        db_query laravel "SELECT count(*) FROM migrations"
+    fi
 }
 
 echo "# Work dir: $WORK"
 
-echo "# Creating a Laravel application with Sail installed (pgsql)"
+case "$DB" in
+    pgsql|mysql|mariadb) SERVICES="$DB" ;;
+    sqlite) SERVICES=redis ;;
+    *) fail "unknown SAIL_E2E_DB '$DB'" ;;
+esac
+
+echo "# Creating a Laravel application with Sail installed ($DB)"
 composer create-project laravel/laravel "$APP" "$LARAVEL_VERSION" --remove-vcs --no-interaction --prefer-dist --quiet
 cd "$APP"
 composer config minimum-stability dev
 composer config repositories.sail "{\"type\": \"path\", \"url\": \"$SAIL_REPO\", \"options\": {\"symlink\": false}}"
 composer require laravel/sail:* --dev -W --no-interaction --quiet
-php artisan sail:install --php="$PHP_VERSION" --with=pgsql --no-interaction
+php artisan sail:install --php="$PHP_VERSION" --with="$SERVICES" --no-interaction
 
 # Rename the app and database services and set a project name unlike the directory name, so
 # nothing can be derived from names. Declare an app service variable that must reach commands.
 sed -i.bak \
     -e 's/^    laravel\.test:/    app:/' \
-    -e 's/^    pgsql:/    database:/' \
-    -e 's/- pgsql$/- database/' \
+    -e "s/^    $DB:/    database:/" \
+    -e "s/- $DB\$/- database/" \
     -e '/LARAVEL_SAIL: 1$/{p;s/LARAVEL_SAIL: 1/SAIL_E2E_SERVICE_VAR: from-compose/;}' \
     compose.yaml
 rm compose.yaml.bak
-sed -i.bak -e 's/^DB_HOST=.*/DB_HOST=database/' .env
-rm .env.bak
+if [ "$DB" != "sqlite" ]; then
+    sed -i.bak -e 's/^DB_HOST=.*/DB_HOST=database/' .env
+    rm .env.bak
+
+    # A database test, so "sail test --parallel" creates its _test_N databases...
+    composer require brianium/paratest --dev -W --no-interaction --quiet
+    cat > tests/Feature/WorktreeDatabaseTest.php << 'PHP'
+<?php
+
+namespace Tests\Feature;
+
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Tests\TestCase;
+
+class WorktreeDatabaseTest extends TestCase
+{
+    use RefreshDatabase;
+
+    public function test_database_is_usable(): void
+    {
+        $this->assertDatabaseHas('migrations', ['migration' => '0001_01_01_000000_create_users_table']);
+    }
+}
+PHP
+fi
 cat >> .env << EOF
 APP_SERVICE=app
 COMPOSE_PROJECT_NAME=$PROJECT
 APP_PORT=0
 FORWARD_DB_PORT=0
+FORWARD_REDIS_PORT=0
 VITE_PORT=$((20000 + RANDOM % 20000))
 EOF
 echo '{}' > auth.json
@@ -107,7 +160,7 @@ vendor/bin/sail up -d --wait
 vendor/bin/sail artisan migrate --no-interaction
 vendor/bin/sail test
 pass "main checkout: up, migrate and test"
-MAIN_MIGRATIONS="$(psql_query laravel "SELECT count(*) FROM migrations")"
+MAIN_DATABASE_STATE="$(main_database_state)"
 
 expect_failure "worktree setup refused in the main checkout" "main checkout" vendor/bin/sail worktree setup
 
@@ -130,13 +183,21 @@ cmp -s "$APP/.env" .env || fail "setup copies .env"
 cmp -s "$APP/auth.json" auth.json || fail "setup copies auth.json"
 [ -x vendor/bin/sail ] || fail "setup copies vendor"
 [ -f node_modules/sail-e2e/marker ] || fail "setup copies node_modules"
-database_exists "$WORKTREE_DATABASE" || fail "setup creates worktree database $WORKTREE_DATABASE"
-pass "setup copies env, auth.json, dependencies and creates $WORKTREE_DATABASE"
+if [ "$DB" == "sqlite" ]; then
+    [ -f database/database.sqlite ] && [ ! -s database/database.sqlite ] || fail "setup creates an empty sqlite database file"
+    pass "setup copies env, auth.json, dependencies and creates an empty sqlite database file"
+else
+    database_exists "$WORKTREE_DATABASE" || fail "setup creates worktree database $WORKTREE_DATABASE"
+    pass "setup copies env, auth.json, dependencies and creates $WORKTREE_DATABASE"
+fi
 
 vendor/bin/sail worktree setup > /dev/null
 pass "setup is re-runnable"
 
 EXPECTED="$WORKTREE_DATABASE|${WORKTREE_DATABASE}_|${WORKTREE_DATABASE}_cache_|from-compose|sail-e2e"
+if [ "$DB" == "sqlite" ]; then
+    EXPECTED="|${EXPECTED#*|}"
+fi
 ACTUAL="$(AI_AGENT=sail-e2e vendor/bin/sail php -r 'echo implode("|", array_map("getenv", ["DB_DATABASE", "REDIS_PREFIX", "CACHE_PREFIX", "SAIL_E2E_SERVICE_VAR", "AI_AGENT"]));')"
 [ "$ACTUAL" == "$EXPECTED" ] || fail "environment: expected $EXPECTED, got $ACTUAL"
 pass "worktree, service and agent variables reach the throwaway container"
@@ -150,11 +211,35 @@ vendor/bin/sail run git status --porcelain | grep -qF "?? $MIGRATION" || fail "g
 pass "git works inside the throwaway container"
 
 vendor/bin/sail artisan migrate --no-interaction
-table_exists "$WORKTREE_DATABASE" wt_markers || fail "migrate runs against the worktree database"
+if [ "$DB" == "sqlite" ]; then
+    [ -s database/database.sqlite ] || fail "migrate runs against the linked worktree's sqlite database file"
+else
+    table_exists "$WORKTREE_DATABASE" wt_markers || fail "migrate runs against the worktree database"
+fi
 vendor/bin/sail test
-table_exists laravel wt_markers && fail "main checkout's database gained the worktree's table"
-[ "$(psql_query laravel "SELECT count(*) FROM migrations")" == "$MAIN_MIGRATIONS" ] || fail "main checkout's migrations changed"
+if [ "$DB" != "sqlite" ]; then
+    table_exists laravel wt_markers && fail "main checkout's database gained the worktree's table"
+fi
+[ "$(main_database_state)" == "$MAIN_DATABASE_STATE" ] || fail "main checkout's database changed"
 pass "migrate and test pass in the linked worktree, main checkout's database untouched"
+
+echo "# Worktree databases per driver"
+if [ "$DB" != "sqlite" ]; then
+    vendor/bin/sail test --parallel --processes=2
+    database_exists "${WORKTREE_DATABASE}_test_1" || fail "sail test --parallel creates ${WORKTREE_DATABASE}_test_1"
+    pass "sail test --parallel creates its _test_N databases"
+fi
+
+if [ "$DB" == "mysql" ] || [ "$DB" == "mariadb" ]; then
+    vendor/bin/sail "$DB" <<< 'SELECT DATABASE();' | grep -qx "$WORKTREE_DATABASE" || fail "sail $DB opens the worktree database"
+    pass "sail $DB opens the worktree database"
+fi
+
+cp -p "$APP/.env" "$WORK/main.env"
+sed -i.bak -e 's/^DB_CONNECTION=.*/DB_CONNECTION=sqlsrv/' "$APP/.env"
+expect_failure "worktree setup fails for an unsupported driver" "sqlsrv" vendor/bin/sail worktree setup
+mv "$WORK/main.env" "$APP/.env"
+rm "$APP/.env.bak"
 
 vendor/bin/sail composer --version > /dev/null
 vendor/bin/sail bin phpunit --version > /dev/null
