@@ -152,8 +152,8 @@ function resolve_sail_stack {
     done < "$CACHE"
 }
 
-# Run a command in a throwaway container...
-function run_in_throwaway_container {
+# Set ARGS to the docker arguments of a throwaway container, up to its image...
+function throwaway_container_args {
     resolve_sail_stack
 
     ARGS=(run --rm -i)
@@ -171,8 +171,18 @@ function run_in_throwaway_container {
 
     # The main checkout's git dir is mounted at its host path, so git works inside the container.
     ARGS+=(-v "$WORKTREE_DIR:/var/www/html" -v "$GIT_COMMON_DIR:$GIT_COMMON_DIR" -w /var/www/html)
+}
 
+# Run a command in a throwaway container...
+function run_in_throwaway_container {
+    throwaway_container_args
     exec "$SAIL_DOCKER_BINARY" "${ARGS[@]}" "$APP_IMAGE" "$@"
+}
+
+# Run a command in a throwaway container and return its exit code...
+function run_in_setup_container {
+    throwaway_container_args
+    "$SAIL_DOCKER_BINARY" "${ARGS[@]}" "$APP_IMAGE" "$@"
 }
 
 # Copy a directory, with reflinks where the filesystem supports them...
@@ -193,9 +203,11 @@ function worktree_setup {
         fi
     done
 
+    COPIED_DIRS=" "
     for DIR in vendor node_modules; do
         if [ -d "$MAIN_CHECKOUT/$DIR" ] && [ ! -e "$WORKTREE_DIR/$DIR" ]; then
             copy_tree "$MAIN_CHECKOUT/$DIR" "$WORKTREE_DIR/$DIR" || exit 1
+            COPIED_DIRS+="$DIR "
         fi
     done
 
@@ -210,7 +222,68 @@ function worktree_setup {
         pgsql_query "CREATE DATABASE \"$WORKTREE_DATABASE\"" > /dev/null || exit 1
     fi
 
+    sync_dependencies
+
     echo "${GREEN}Worktree setup complete.${NC} Worktree database: $WORKTREE_DATABASE"
+
+    run_after_setup_step
+}
+
+# Install dependencies in a throwaway container where the copied ones may not match the linked
+# worktree's lockfile: it differs byte-for-byte from the main checkout's, or nothing was copied.
+# A lockfile is not installed again until it changes: the last installed copy of each lockfile is
+# kept in the linked worktree's git dir...
+function sync_dependencies {
+    local STATE_DIR="$GIT_DIR/sail-worktree" LOCKFILE DIR INSTALL
+
+    for LOCKFILE in composer.lock package-lock.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb; do
+        [ -f "$WORKTREE_DIR/$LOCKFILE" ] || continue
+
+        if [ "$LOCKFILE" == "composer.lock" ]; then
+            DIR=vendor
+            INSTALL=(composer install --no-interaction)
+        elif [ "$DIR" == "node_modules" ]; then
+            continue
+        else
+            DIR=node_modules
+            case "$LOCKFILE" in
+                package-lock.json) INSTALL=(npm ci) ;;
+                pnpm-lock.yaml) INSTALL=(pnpm install --frozen-lockfile) ;;
+                yarn.lock) INSTALL=(yarn install) ;;
+                *) INSTALL=(bun install --frozen-lockfile) ;;
+            esac
+        fi
+
+        if cmp -s "$WORKTREE_DIR/$LOCKFILE" "$STATE_DIR/$LOCKFILE"; then
+            continue
+        fi
+
+        if [[ "$COPIED_DIRS" != *" $DIR "* ]] || ! cmp -s "$WORKTREE_DIR/$LOCKFILE" "$MAIN_CHECKOUT/$LOCKFILE"; then
+            echo "${BOLD}Installing dependencies:${NC} ${INSTALL[*]}"
+            run_in_setup_container "${INSTALL[@]}" || worktree_fail "Installing dependencies failed: ${INSTALL[*]}"
+        fi
+
+        mkdir -p "$STATE_DIR"
+        cp "$WORKTREE_DIR/$LOCKFILE" "$STATE_DIR/$LOCKFILE" || exit 1
+    done
+}
+
+# Run the project's Composer script "sail-worktree-setup" in a throwaway container, if it defines
+# one. The linked worktree is already set up, so a failure only makes setup exit non-zero...
+function run_after_setup_step {
+    # shellcheck disable=SC2016
+    if ! run_in_setup_container php -r '
+        $scripts = json_decode(file_get_contents("composer.json"), true)["scripts"] ?? [];
+        if (! array_key_exists("sail-worktree-setup", $scripts)) {
+            exit(0);
+        }
+        echo "Running the after-setup step: composer run-script sail-worktree-setup\n";
+        passthru("composer run-script sail-worktree-setup", $code);
+        exit($code);
+    '; then
+        worktree_fail "The after-setup step failed." \
+            "The linked worktree is set up: Sail commands run. Re-run it with: sail worktree setup"
+    fi
 }
 
 # Run SQL in the database service container as the configured user...

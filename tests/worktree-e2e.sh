@@ -165,6 +165,103 @@ pass "the copied .env is not rewritten"
 
 expect_failure "unknown commands are refused" "$APP" vendor/bin/sail up -d
 
+echo "# Dependency sync and after-setup step"
+# setup_output <name> <sail>: runs worktree setup, saving its output in $WORK/<name>.out.
+function setup_output {
+    "$2" worktree setup > "$WORK/$1.out" 2>&1 || { cat "$WORK/$1.out" >&2; return 1; }
+}
+
+# host_composer <args...>: changes a lockfile with the host's composer, which reaches the path
+# repository of this copy of Sail. Linked worktree commands never use it.
+function host_composer {
+    PATH="${PATH#"$WORK/no-host-tools:"}" composer "$@" --no-install --no-scripts --no-interaction --quiet
+}
+
+cd "$APP"
+git worktree add -q -b wt-deps "$WORK/wt-deps"
+cd "$WORK/wt-deps"
+setup_output deps-first "$APP/vendor/bin/sail" || fail "setup in wt-deps"
+grep -qF "Installing dependencies" "$WORK/deps-first.out" && fail "identical lockfiles run no installer"
+pass "identical lockfiles: dependencies copied, no installer runs"
+
+# The wt-deps branch drops a package and defines an after-setup step.
+cat > after-setup.php << 'EOF'
+<?php
+if (file_exists('after-setup.fail')) {
+    fwrite(STDERR, "after-setup failed on purpose\n");
+    exit(3);
+}
+file_put_contents('after-setup.marker', (is_dir('vendor/laravel/pint') ? 'pint-present ' : '').getenv('DB_DATABASE'));
+EOF
+printf 'after-setup.marker\nafter-setup.fail\n' >> .gitignore
+vendor/bin/sail composer config scripts.sail-worktree-setup "@php after-setup.php"
+host_composer remove --dev laravel/pint
+[ -d vendor/laravel/pint ] || fail "composer remove --no-install keeps the installed package"
+git add -A
+git commit -q -m "Drop pint, add an after-setup step"
+DEPS_DATABASE="sail_wt_wt_deps_$(printf '%s' "$PWD" | git hash-object --stdin | cut -c1-8)"
+
+setup_output deps-resync vendor/bin/sail || fail "setup after a lockfile change"
+grep -qF "composer install" "$WORK/deps-resync.out" || fail "a lockfile change resyncs on re-run"
+[ ! -d vendor/laravel/pint ] || fail "resync removes the dropped package"
+[ "$(cat after-setup.marker)" == "$DEPS_DATABASE" ] || fail "after-setup step runs after dependencies, in the worktree environment: $(cat after-setup.marker)"
+pass "re-running setup after a lockfile change resyncs, then runs the after-setup step"
+
+rm after-setup.marker
+setup_output deps-again vendor/bin/sail || fail "setup with nothing changed"
+grep -qF "Installing dependencies" "$WORK/deps-again.out" && fail "setup with nothing changed runs no installer"
+[ -f after-setup.marker ] || fail "setup with nothing changed still runs the after-setup step"
+pass "re-running setup with nothing changed only runs the after-setup step"
+
+[ -z "$(git status --porcelain)" ] || fail "setup leaves the working tree clean: $(git status --porcelain)"
+pass "no setup state file in the working tree"
+
+touch after-setup.fail
+expect_failure "a failing after-setup step makes setup exit non-zero" "after-setup failed on purpose" vendor/bin/sail worktree setup
+vendor/bin/sail artisan --version > /dev/null || fail "commands run after a failing after-setup step"
+pass "commands still run after a failing after-setup step"
+rm after-setup.fail
+
+cd "$APP"
+git worktree add -q "$WORK/wt-branch" wt-deps
+cd "$WORK/wt-branch"
+setup_output branch "$APP/vendor/bin/sail" || fail "setup in wt-branch"
+grep -qF "composer install" "$WORK/branch.out" || fail "a changed composer.lock runs composer install"
+[ -x vendor/bin/sail ] || fail "the linked worktree has vendor"
+[ ! -d vendor/laravel/pint ] || fail "the linked worktree has the branch's packages"
+pass "changed composer.lock: dependencies copied, then composer install to the branch's packages"
+
+# Each Node package manager is chosen by its lockfile. A local package keeps installs offline.
+mkdir local-dep
+echo '{"name": "local-dep", "version": "1.0.0"}' > local-dep/package.json
+echo '{"private": true, "dependencies": {"local-dep": "file:./local-dep"}}' > package.json
+for INSTALL in "npm ci" "pnpm install" "yarn install" "bun install"; do
+    MANAGER="${INSTALL%% *}"
+    rm -rf node_modules package-lock.json pnpm-lock.yaml yarn.lock bun.lock .pnp.* .yarn
+    vendor/bin/sail run "$MANAGER" install > /dev/null 2>&1 || fail "$MANAGER creates a lockfile"
+    setup_output "node-$MANAGER" vendor/bin/sail || fail "setup with a $MANAGER lockfile"
+    grep -qF "Installing dependencies: $INSTALL" "$WORK/node-$MANAGER.out" || fail "a $MANAGER lockfile runs $INSTALL"
+done
+pass "npm, pnpm, yarn and bun are each selected by their lockfile"
+
+rm -rf node_modules package-lock.json pnpm-lock.yaml yarn.lock bun.lock .pnp.* .yarn
+setup_output node-none vendor/bin/sail || fail "setup with no Node lockfile"
+grep -qF "Installing dependencies" "$WORK/node-none.out" && fail "no Node lockfile runs no Node installer"
+pass "no Node lockfile: no Node step, setup succeeds"
+
+echo "# Main checkout without vendor"
+cd "$APP"
+git worktree add -q -b wt-no-vendor "$WORK/wt-no-vendor"
+cd "$WORK/wt-no-vendor"
+# The container cannot reach Sail's path repository, so this branch installs only from Packagist.
+host_composer remove --dev laravel/sail
+mv "$APP/vendor" "$WORK/main-vendor"
+setup_output no-vendor "$SAIL_REPO/bin/sail" || { mv "$WORK/main-vendor" "$APP/vendor"; fail "setup with no vendor in the main checkout"; }
+mv "$WORK/main-vendor" "$APP/vendor"
+grep -qF "composer install" "$WORK/no-vendor.out" || fail "no vendor in the main checkout runs composer install"
+[ -f vendor/autoload.php ] || fail "composer install fills vendor"
+pass "main checkout without vendor: setup installs in the container"
+
 echo "# Unsupported layouts"
 git clone -q --bare "$APP" "$WORK/bare.git"
 git -C "$WORK/bare.git" worktree add -q "$WORK/bare-wt"
