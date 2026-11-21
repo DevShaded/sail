@@ -84,9 +84,12 @@ function main_compose {
     (cd "$MAIN_CHECKOUT" && "${COMPOSE_CMD[@]}" "$@")
 }
 
+# Exits with 75, so the post-checkout hook can leave phase 2 of worktree setup for later...
 function sail_stack_not_running {
-    worktree_fail "The main checkout's Sail stack is not running: $MAIN_CHECKOUT" \
-        "Start it there with: cd \"$MAIN_CHECKOUT\" && ./vendor/bin/sail up -d"
+    echo "${BOLD}The main checkout's Sail stack is not running: $MAIN_CHECKOUT${NC}" >&2
+    echo "Start it there with: cd \"$MAIN_CHECKOUT\" && ./vendor/bin/sail up -d" >&2
+
+    exit 75
 }
 
 # Print the ID of a service's running container in the main checkout's Sail stack...
@@ -150,7 +153,7 @@ function resolve_sail_stack {
 
     # On sqlite, the Sail stack has no database service...
     if [ "$DB_CONNECTION" != "sqlite" ]; then
-        DB_CONTAINER="$(database_container)" || exit 1
+        DB_CONTAINER="$(database_container)" || exit
     fi
 
     # Parse the rest of the configuration with PHP inside the app image, so the host needs neither
@@ -210,6 +213,7 @@ function throwaway_container_args {
 
 # Run a command in a throwaway container...
 function run_in_throwaway_container {
+    ensure_worktree_setup
     throwaway_container_args
     exec "$SAIL_DOCKER_BINARY" "${ARGS[@]}" "$APP_IMAGE" "$@"
 }
@@ -222,6 +226,7 @@ function run_in_setup_container {
 
 # Run a command in a running service container of the main checkout's Sail stack...
 function exec_in_container {
+    ensure_worktree_setup
     interactive_args exec
     exec "$SAIL_DOCKER_BINARY" "${ARGS[@]}" "$@"
 }
@@ -235,8 +240,50 @@ function copy_tree {
     fi
 }
 
-function worktree_setup {
-    local FILE DIR DATABASE_INFO="Worktree database: $WORKTREE_DATABASE"
+# Take a lock: a symlink to the holder's PID, which ln creates atomically. A lock whose holder
+# died is broken by one waiter at a time, and only while it still names that holder...
+function acquire_lock {
+    local HOLDER BREAKER
+
+    mkdir -p "${1%/*}" || exit 1
+
+    until ln -s "$$" "$1" 2> /dev/null; do
+        HOLDER="$(readlink "$1" 2> /dev/null)"
+
+        if [ -n "$HOLDER" ] && ! kill -0 "$HOLDER" 2> /dev/null; then
+            if ln -s "$$" "$1.break" 2> /dev/null; then
+                if [ "$(readlink "$1" 2> /dev/null)" == "$HOLDER" ]; then
+                    rm -f "$1"
+                fi
+                rm -f "$1.break"
+                continue
+            fi
+
+            BREAKER="$(readlink "$1.break" 2> /dev/null)"
+            if [ -n "$BREAKER" ] && ! kill -0 "$BREAKER" 2> /dev/null; then
+                rm -f "$1.break"
+            fi
+        fi
+
+        sleep 1
+    done
+}
+
+function release_lock {
+    if [ "$(readlink "$1" 2> /dev/null)" == "$$" ]; then
+        rm -f "$1"
+    fi
+}
+
+STATE_DIR="$GIT_DIR/sail-worktree"
+SETUP_LOCK="$STATE_DIR/setup.lock"
+SETUP_COMPLETE="$STATE_DIR/setup-complete"
+
+# Phase 1 of worktree setup needs no Sail stack: copy what the linked worktree lacks from the main
+# checkout. A copied dependency directory is recorded in the state dir, so a later phase 2 knows
+# the copy matches the main checkout's lockfile...
+function copy_from_main_checkout {
+    local FILE DIR
 
     for FILE in "$MAIN_CHECKOUT"/.env* "$MAIN_CHECKOUT/auth.json"; do
         if [ -f "$FILE" ] && [ ! -e "$WORKTREE_DIR/${FILE##*/}" ]; then
@@ -244,13 +291,18 @@ function worktree_setup {
         fi
     done
 
-    COPIED_DIRS=" "
     for DIR in vendor node_modules; do
         if [ -d "$MAIN_CHECKOUT/$DIR" ] && [ ! -e "$WORKTREE_DIR/$DIR" ]; then
             copy_tree "$MAIN_CHECKOUT/$DIR" "$WORKTREE_DIR/$DIR" || exit 1
-            COPIED_DIRS+="$DIR "
+            touch "$STATE_DIR/copied-$DIR" || exit 1
         fi
     done
+}
+
+# Phase 2 of worktree setup needs the Sail stack. The linked worktree is set up once its worktree
+# database and dependencies are ready; the after-setup step runs after that...
+function finish_setup {
+    DATABASE_INFO="Worktree database: $WORKTREE_DATABASE"
 
     check_database_driver
     resolve_sail_stack
@@ -264,9 +316,53 @@ function worktree_setup {
 
     sync_dependencies
 
+    touch "$SETUP_COMPLETE" || exit 1
     echo "${GREEN}Worktree setup complete.${NC} $DATABASE_INFO"
 
     run_after_setup_step
+}
+
+# Run worktree setup under the per-worktree lock. "hook": when the Sail stack is down, run only
+# phase 1 and leave phase 2 to the first sail command. "lazy": run only if no earlier setup
+# finished, which a concurrent command may have done while this one waited for the lock...
+function worktree_setup {
+    local STATUS=0
+
+    acquire_lock "$SETUP_LOCK"
+    trap 'release_lock "$SETUP_LOCK"' EXIT
+
+    if [ "${1:-}" != "lazy" ] || [ ! -e "$SETUP_COMPLETE" ]; then
+        copy_from_main_checkout
+        # A subshell, so a failure in phase 2 returns here and releases the lock...
+        (finish_setup) || STATUS=$?
+    fi
+
+    release_lock "$SETUP_LOCK"
+    trap - EXIT
+
+    if [ "$STATUS" == "75" ] && [ "${1:-}" == "hook" ]; then
+        echo "Worktree setup will finish on the first sail command in this linked worktree once the main checkout's Sail stack runs."
+        return 0
+    fi
+
+    return "$STATUS"
+}
+
+# Before a command, finish worktree setup if no setup has finished yet. A failed after-setup step
+# does not stop the command...
+function ensure_worktree_setup {
+    local STATUS
+
+    if [ -e "$SETUP_COMPLETE" ]; then
+        return
+    fi
+
+    worktree_setup lazy
+    STATUS=$?
+
+    if [ "$STATUS" != "0" ] && [ ! -e "$SETUP_COMPLETE" ]; then
+        exit "$STATUS"
+    fi
 }
 
 # Install dependencies in a throwaway container where the copied ones may not match the linked
@@ -274,7 +370,7 @@ function worktree_setup {
 # A lockfile is not installed again until it changes: the last installed copy of each lockfile is
 # kept in the linked worktree's git dir...
 function sync_dependencies {
-    local STATE_DIR="$GIT_DIR/sail-worktree" LOCKFILE DIR INSTALL
+    local LOCKFILE DIR INSTALL
 
     for LOCKFILE in composer.lock package-lock.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb; do
         [ -f "$WORKTREE_DIR/$LOCKFILE" ] || continue
@@ -298,12 +394,11 @@ function sync_dependencies {
             continue
         fi
 
-        if [[ "$COPIED_DIRS" != *" $DIR "* ]] || ! cmp -s "$WORKTREE_DIR/$LOCKFILE" "$MAIN_CHECKOUT/$LOCKFILE"; then
+        if [ ! -e "$STATE_DIR/copied-$DIR" ] || ! cmp -s "$WORKTREE_DIR/$LOCKFILE" "$MAIN_CHECKOUT/$LOCKFILE"; then
             echo "${BOLD}Installing dependencies:${NC} ${INSTALL[*]}"
             run_in_setup_container "${INSTALL[@]}" || worktree_fail "Installing dependencies failed: ${INSTALL[*]}"
         fi
 
-        mkdir -p "$STATE_DIR"
         cp "$WORKTREE_DIR/$LOCKFILE" "$STATE_DIR/$LOCKFILE" || exit 1
     done
 }
@@ -343,30 +438,13 @@ function prune_worktree_databases {
         return
     fi
 
-    acquire_prune_lock "$LOCK"
+    acquire_lock "$LOCK"
     drop_dead_worktree_databases || STATUS=$?
-    rm -rf "$LOCK"
+    release_lock "$LOCK"
 
     if [ "$STATUS" != 0 ]; then
         exit "$STATUS"
     fi
-}
-
-# Take the lock directory, taking it over when its holder died...
-function acquire_prune_lock {
-    local HOLDER
-
-    mkdir -p "${1%/*}"
-    until mkdir "$1" 2> /dev/null; do
-        HOLDER="$(cat "$1/pid" 2> /dev/null)"
-        if [ -n "$HOLDER" ] && ! kill -0 "$HOLDER" 2> /dev/null; then
-            rm -rf "$1"
-        else
-            sleep 1
-        fi
-    done
-
-    echo $$ > "$1/pid"
 }
 
 function drop_dead_worktree_databases {
@@ -469,7 +547,12 @@ case "$1" in
     worktree)
         case "${2:-}" in
             setup)
-                worktree_setup
+                # The post-checkout hook passes --hook...
+                if [ "${3:-}" == "--hook" ]; then
+                    worktree_setup hook
+                else
+                    worktree_setup
+                fi
                 ;;
             prune)
                 check_database_driver
