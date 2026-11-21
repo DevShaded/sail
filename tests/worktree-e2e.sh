@@ -114,6 +114,14 @@ sed -i.bak \
     -e '/LARAVEL_SAIL: 1$/{p;s/LARAVEL_SAIL: 1/SAIL_E2E_SERVICE_VAR: from-compose/;}' \
     compose.yaml
 rm compose.yaml.bak
+# An untracked compose file listed in the main checkout's SAIL_FILES, which a linked worktree lacks...
+cat > compose.e2e.yaml << 'YAML'
+services:
+    app:
+        environment:
+            SAIL_E2E_FILES_VAR: from-sail-files
+YAML
+echo compose.e2e.yaml >> .gitignore
 if [ "$DB" != "sqlite" ]; then
     sed -i.bak -e 's/^DB_HOST=.*/DB_HOST=database/' .env
     rm .env.bak
@@ -141,6 +149,7 @@ PHP
 fi
 cat >> .env << EOF
 APP_SERVICE=app
+SAIL_FILES=compose.yaml:compose.e2e.yaml
 COMPOSE_PROJECT_NAME=$PROJECT
 APP_PORT=0
 FORWARD_DB_PORT=0
@@ -242,7 +251,7 @@ OUTPUT="$(git clone -q "$APP" "$WORK/clone" 2>&1)" || fail "git clone: $OUTPUT"
 grep -qi "worktree setup" <<< "$OUTPUT" && fail "git clone triggers worktree setup: $OUTPUT"
 pass "composer in a linked worktree writes no hook; checkouts, clones and branch switches skip setup"
 
-# --- Agent notes (#10) ---
+# --- Agent notes ---
 cat > "$WORK/notes.expected" << 'EOF'
 <!-- sail-worktree:start -->
 ## Sail in git worktrees
@@ -298,7 +307,7 @@ pass "a deleted notes block returns; missing CLAUDE.md and AGENTS.md are not cre
     rm CLAUDE.md AGENTS.md
 )
 pass "composer in a linked worktree writes no notes"
-# --- End agent notes (#10) ---
+# --- End agent notes ---
 
 OUTPUT="$(SAIL_DOCKER_BINARY=false git worktree add -b failing-wt "$WORK/failing-wt" 2>&1)" \
     || fail "git worktree add exits 0 when worktree setup fails: $OUTPUT"
@@ -344,13 +353,22 @@ fi
 vendor/bin/sail worktree setup > /dev/null
 pass "setup is re-runnable"
 
-EXPECTED="$WORKTREE_DATABASE|${WORKTREE_DATABASE}_|${WORKTREE_DATABASE}_cache_|from-compose|sail-e2e"
+EXPECTED="$WORKTREE_DATABASE|${WORKTREE_DATABASE}_|${WORKTREE_DATABASE}_cache_|from-compose|from-sail-files|sail-e2e"
 if [ "$DB" == "sqlite" ]; then
     EXPECTED="|${EXPECTED#*|}"
 fi
-ACTUAL="$(AI_AGENT=sail-e2e vendor/bin/sail php -r 'echo implode("|", array_map("getenv", ["DB_DATABASE", "REDIS_PREFIX", "CACHE_PREFIX", "SAIL_E2E_SERVICE_VAR", "AI_AGENT"]));')"
+ACTUAL="$(AI_AGENT=sail-e2e vendor/bin/sail php -r 'echo implode("|", array_map("getenv", ["DB_DATABASE", "REDIS_PREFIX", "CACHE_PREFIX", "SAIL_E2E_SERVICE_VAR", "SAIL_E2E_FILES_VAR", "AI_AGENT"]));')"
 [ "$ACTUAL" == "$EXPECTED" ] || fail "environment: expected $EXPECTED, got $ACTUAL"
 pass "worktree, service and agent variables reach the throwaway container"
+
+# What the linked worktree's env file sets must not change what is resolved for the main checkout...
+cp -p .env "$WORK/linked.env"
+printf 'SAIL_FILES=nowhere.yaml\nSAIL_DOCKER_BINARY=false\nAPP_SERVICE=nowhere\nDB_HOST=nowhere\n' >> .env
+ACTUAL="$(vendor/bin/sail php -r 'echo getenv("SAIL_E2E_FILES_VAR");' 2>&1)" || fail "a command with a diverging linked env file: $ACTUAL"
+[ "$ACTUAL" == "from-sail-files" ] || fail "the compose configuration uses the main checkout's SAIL_FILES, got: $ACTUAL"
+OUTPUT="$(vendor/bin/sail worktree setup 2>&1)" || fail "worktree setup with a diverging linked env file: $OUTPUT"
+mv "$WORK/linked.env" .env
+pass "the main checkout's env files, SAIL_FILES and SAIL_DOCKER_BINARY win over the linked worktree's env file"
 
 vendor/bin/sail artisan make:migration create_wt_markers_table > /dev/null
 MIGRATION="$(ls database/migrations/*_create_wt_markers_table.php)"
@@ -398,7 +416,7 @@ pass "composer and bin run in the throwaway container"
 cmp -s "$APP/.env" .env || fail "the copied .env is not rewritten"
 pass "the copied .env is not rewritten"
 
-# --- Command surface (#4) ---
+# --- Command surface ---
 [ "$(vendor/bin/sail art --version)" == "$(vendor/bin/sail a --version)" ] || fail "artisan aliases run artisan"
 vendor/bin/sail phpunit --version > /dev/null
 vendor/bin/sail tinker --execute 'echo "tinker-ok";' | grep -qx tinker-ok || fail "tinker runs in the throwaway container"
@@ -416,12 +434,18 @@ if [ "$DB" == "pgsql" ]; then
     pass "psql connects to the worktree database"
 fi
 
+for COMMAND in "" help; do
+    OUTPUT="$(vendor/bin/sail ${COMMAND:+"$COMMAND"} 2>&1)" || true
+    grep -qF "sail COMMAND" <<< "$OUTPUT" || fail "'sail $COMMAND' shows help in a linked worktree, got: $OUTPUT"
+done
+pass "'sail' and 'sail help' show help in a linked worktree"
+
 for COMMAND in down share dusk; do
     expect_failure "'sail $COMMAND' is refused, naming the main checkout" "$APP" vendor/bin/sail "$COMMAND"
 done
-# --- End command surface (#4) ---
+# --- End command surface ---
 
-# --- Prune (#7) ---
+# --- Prune ---
 echo "# Prune"
 # worktree_database_of <linked worktree path>: its worktree database name, per the spec's naming.
 function worktree_database_of {
@@ -518,7 +542,7 @@ else
         db_query "$CREATE_IN" "DROP DATABASE $NAME" > /dev/null
     done
 fi
-# --- End prune (#7) ---
+# --- End prune ---
 
 expect_failure "unknown commands are refused" "$APP" vendor/bin/sail up -d
 
@@ -643,13 +667,13 @@ vendor/bin/sail down
 cd "$WORKTREE"
 expect_failure "commands name the main checkout when its stack is down" "$APP" vendor/bin/sail artisan --version
 expect_failure "commands say how to start the stack" "sail up" vendor/bin/sail artisan --version
-# --- Prune, Sail stack down (#7) ---
+# --- Prune, Sail stack down ---
 if [ "$DB" != "sqlite" ]; then
     expect_failure "prune names the main checkout when its stack is down" "$APP" vendor/bin/sail worktree prune
 fi
-# --- End prune, Sail stack down (#7) ---
+# --- End prune, Sail stack down ---
 
-# --- Two-phase, lazy and concurrent setup (#9) ---
+# --- Two-phase, lazy and concurrent setup ---
 # worktree_database_of <dir>: the worktree database name of a linked worktree.
 function worktree_database_of {
     local SLUG
@@ -709,6 +733,22 @@ grep -qF "Laravel Framework" "$WORK/race-1.out" || fail "the first concurrent co
 grep -qF "Laravel Framework" "$WORK/race-2.out" || fail "the second concurrent command runs"
 pass "two concurrent commands in a fresh linked worktree run setup once, then both run"
 
+# A lock whose holder runs as another user is live, though kill -0 is not permitted on it...
+cd "$APP"
+git -c core.hooksPath=/dev/null worktree add -q -b wt-foreign "$WORK/wt-foreign"
+cd "$WORK/wt-foreign"
+LOCK="$(git rev-parse --absolute-git-dir)/sail-worktree/setup.lock"
+mkdir -p "${LOCK%/*}"
+ln -s 1 "$LOCK"
+"$APP/vendor/bin/sail" artisan --version > "$WORK/foreign.out" 2>&1 &
+FOREIGN=$!
+sleep 5
+kill -0 "$FOREIGN" 2> /dev/null || fail "a command waits for a lock held by a live process, got: $(cat "$WORK/foreign.out")"
+[ "$(readlink "$LOCK")" == "1" ] || fail "a lock held by a live process is not broken"
+rm "$LOCK"
+wait "$FOREIGN" || { cat "$WORK/foreign.out" >&2; fail "the waiting command runs once the lock is released"; }
+pass "a lock held by another user's live process is waited for, not broken"
+
 # Kill a setup once phase 1 copied the dependencies, so its lock stays behind...
 cd "$APP"
 git -c core.hooksPath=/dev/null worktree add -q -b wt-killed "$WORK/wt-killed"
@@ -740,6 +780,6 @@ for N in 1 2 3; do
     worktree_database_ready "$WORK/wt-par-$N" || fail "parallel git worktree add $N creates its worktree database"
 done
 pass "parallel git worktree add runs all set up, each with its own worktree database"
-# --- End two-phase, lazy and concurrent setup (#9) ---
+# --- End two-phase, lazy and concurrent setup ---
 
 echo "# All worktree end-to-end checks passed"

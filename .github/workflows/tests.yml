@@ -19,12 +19,11 @@ jobs:
       matrix:
         php: [8.2, 8.3, 8.4, 8.5]
         laravel: [12, 13]
-        db: [pgsql, mysql, mariadb, sqlite]
         exclude:
           - php: 8.2
             laravel: 13
 
-    name: PHP ${{ matrix.php }} - Laravel ${{ matrix.laravel }} - ${{ matrix.db }}
+    name: PHP ${{ matrix.php }} - Laravel ${{ matrix.laravel }}
 
     steps:
 
@@ -79,9 +78,34 @@ jobs:
         run: ../sail/bin/sail down
         working-directory: app
 
-      - name: Run Worktree End-to-End Test (${{ matrix.db }})
+  worktree:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: true
+      matrix:
+        db: [pgsql, mysql, mariadb, sqlite]
+
+    name: Worktree End-to-End - ${{ matrix.db }}
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: 'sail'
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
+        with:
+          php-version: 8.5
+          extensions: dom, curl, libxml, mbstring, zip, fileinfo
+          ini-values: error_reporting=E_ALL
+          tools: composer:v2
+          coverage: none
+
+      - name: Run Worktree End-to-End Test
         run: sail/tests/worktree-e2e.sh
         env:
           SAIL_E2E_DB: ${{ matrix.db }}
-          SAIL_E2E_PHP: ${{ matrix.php }}
-          SAIL_E2E_LARAVEL: ${{ matrix.laravel == 13 && 'dev-master' || format('{0}.x', matrix.laravel) }}

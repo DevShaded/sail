@@ -16,8 +16,14 @@ use Composer\Util\ProcessExecutor;
  */
 class WorktreePlugin implements PluginInterface, EventSubscriberInterface
 {
+    /**
+     * The first line of the managed block.
+     */
     const BLOCK_START = '# >>> laravel/sail worktree setup >>>';
 
+    /**
+     * The last line of the managed block.
+     */
     const BLOCK_END = '# <<< laravel/sail worktree setup <<<';
 
     /**
@@ -35,7 +41,7 @@ case "$1" in
             # Clear the variables git exports to hooks, so git finds the checkouts on its own...
             # shellcheck disable=SC2046
             unset $(git rev-parse --local-env-vars)
-            [ "$(git rev-parse --path-format=absolute --git-dir)" != "$(git rev-parse --path-format=absolute --git-common-dir)" ] || exit 0
+            [ "$(cd "$(git rev-parse --git-dir)" && pwd -P)" != "$(cd "$(git rev-parse --git-common-dir)" && pwd -P)" ] || exit 0
             sail="$(git worktree list --porcelain | sed -n '1s/^worktree //p')/vendor/bin/sail"
             [ -x "$sail" ] || exit 0
             "$sail" worktree setup --hook || echo "Sail worktree setup failed. Fix the problem above, then run in this linked worktree: \"$sail\" worktree setup" >&2
@@ -46,6 +52,9 @@ esac
 
 SH;
 
+    /**
+     * The first line of the agent notes.
+     */
     const NOTES_START = '<!-- sail-worktree:start -->';
 
     /**
@@ -67,20 +76,43 @@ SH;
 MD;
 
     /**
+     * The Composer input and output.
+     *
      * @var \Composer\IO\IOInterface
      */
     protected $io;
 
+    /**
+     * Activate the plugin.
+     *
+     * @param  \Composer\Composer  $composer
+     * @param  \Composer\IO\IOInterface  $io
+     * @return void
+     */
     public function activate(Composer $composer, IOInterface $io)
     {
         $this->io = $io;
     }
 
+    /**
+     * Deactivate the plugin.
+     *
+     * @param  \Composer\Composer  $composer
+     * @param  \Composer\IO\IOInterface  $io
+     * @return void
+     */
     public function deactivate(Composer $composer, IOInterface $io)
     {
         //
     }
 
+    /**
+     * Remove the managed block when the package is removed.
+     *
+     * @param  \Composer\Composer  $composer
+     * @param  \Composer\IO\IOInterface  $io
+     * @return void
+     */
     public function uninstall(Composer $composer, IOInterface $io)
     {
         $this->io = $io;
@@ -90,6 +122,11 @@ MD;
         }
     }
 
+    /**
+     * Get the Composer events the plugin listens to.
+     *
+     * @return array
+     */
     public static function getSubscribedEvents()
     {
         return [
@@ -202,6 +239,8 @@ MD;
     }
 
     /**
+     * Write a warning to Composer's output.
+     *
      * @param  string  $message
      * @return void
      */

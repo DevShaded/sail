@@ -2,8 +2,9 @@
 # Sail in a linked git worktree.
 #
 # bin/sail sources this file after its environment setup when the current checkout is a linked
-# worktree, or for "sail worktree ...". It reuses bin/sail's MACHINE, BOLD, NC, APP_SERVICE,
-# WWWUSER, SAIL_DOCKER_BINARY, COMPOSE_CMD, AGENT_ENV_VARS and forward_agent_env, and always exits.
+# worktree, or for "sail worktree ...". It reuses bin/sail's MACHINE, BOLD, GREEN, NC, WWWUSER,
+# AGENT_ENV_VARS and forward_agent_env, and always exits. Everything about the Sail stack comes
+# from the main checkout: its env files, SAIL_FILES and SAIL_DOCKER_BINARY.
 #
 # A linked worktree never runs a Sail stack. Each command runs in a throwaway container from the
 # app image that mounts the linked worktree, joins the main checkout's network and uses the shared
@@ -19,11 +20,14 @@ function worktree_fail {
     exit 1
 }
 
-if ! GIT_DIRS="$(git rev-parse --path-format=absolute --git-dir --git-common-dir 2> /dev/null)"; then
+if ! GIT_DIRS="$(git rev-parse --git-dir --git-common-dir 2> /dev/null)"; then
     worktree_fail "Sail worktree commands need a git checkout."
 fi
 
-{ read -r GIT_DIR; read -r GIT_COMMON_DIR; } <<< "$GIT_DIRS"
+# Resolved with pwd, as git before 2.31 has no "rev-parse --path-format"...
+{ read -r WT_GIT_DIR; read -r GIT_COMMON_DIR; } <<< "$GIT_DIRS"
+WT_GIT_DIR="$(cd "$WT_GIT_DIR" && pwd -P)" || exit 1
+GIT_COMMON_DIR="$(cd "$GIT_COMMON_DIR" && pwd -P)" || exit 1
 WORKTREE_LIST="$(git worktree list --porcelain)"
 
 if sed '/^$/q' <<< "$WORKTREE_LIST" | grep -qx 'bare'; then
@@ -40,7 +44,7 @@ function worktree_hash {
 }
 
 # The main checkout runs only "sail worktree prune"...
-if [ "$GIT_DIR" == "$GIT_COMMON_DIR" ]; then
+if [ "$WT_GIT_DIR" == "$GIT_COMMON_DIR" ]; then
     case "${2:-}" in
         prune) ;;
         setup) worktree_fail "This is the main checkout: worktree setup runs only in a linked worktree." ;;
@@ -57,13 +61,28 @@ else
     # Worktree database: sail_wt_<slug>_<hash8>...
     WORKTREE_SLUG="$(printf '%s' "${WORKTREE_DIR##*/}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_')"
     WORKTREE_DATABASE="sail_wt_${WORKTREE_SLUG:0:32}_$(worktree_hash "$WORKTREE_DIR")"
+
+    # The variables the linked worktree's env files set, which bin/sail has loaded...
+    LINKED_ENV_NAMES=()
+    while IFS= read -r NAME; do
+        LINKED_ENV_NAMES+=("$NAME")
+    done < <(sed -n -E 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' \
+        "$WORKTREE_DIR/.env" ${APP_ENV:+"$WORKTREE_DIR/.env.$APP_ENV"} 2> /dev/null)
 fi
+
+# Run a command in the main checkout, without the variables the linked worktree's env files set...
+function in_main_checkout {
+    (
+        cd "$MAIN_CHECKOUT" || exit 1
+        unset "${LINKED_ENV_NAMES[@]}" 2> /dev/null
+        exec "$@"
+    )
+}
 
 # Print a variable from the main checkout's env file, loaded the way bin/sail loads it...
 function main_env {
-    (
-        cd "$MAIN_CHECKOUT" || exit 1
-
+    # shellcheck disable=SC2016
+    in_main_checkout bash -c '
         # shellcheck source=/dev/null
         if [ -n "$APP_ENV" ] && [ -f ./.env."$APP_ENV" ]; then
             source ./.env."$APP_ENV"
@@ -71,18 +90,21 @@ function main_env {
             source ./.env
         fi
 
-        printf '%s' "${!1}"
-    )
+        printf "%s" "${!1}"
+    ' bash "$1"
 }
 
-# The linked worktree may have no env file yet, so the app service comes from the main checkout...
-APP_SERVICE="$(main_env APP_SERVICE)"
-DB_CONNECTION="$(main_env DB_CONNECTION)"
-
-# Run Docker Compose for the main checkout...
+# Run Docker Compose for the main checkout, through bin/sail run there...
 function main_compose {
-    (cd "$MAIN_CHECKOUT" && "${COMPOSE_CMD[@]}" "$@")
+    in_main_checkout env SAIL_SKIP_CHECKS=1 "$(dirname "${BASH_SOURCE[0]}")/sail" "$@"
 }
+
+# The linked worktree may have no env file yet, so these come from the main checkout...
+APP_SERVICE="$(main_env APP_SERVICE)"
+APP_SERVICE="${APP_SERVICE:-laravel.test}"
+SAIL_DOCKER_BINARY="$(main_env SAIL_DOCKER_BINARY)"
+SAIL_DOCKER_BINARY="${SAIL_DOCKER_BINARY:-docker}"
+DB_CONNECTION="$(main_env DB_CONNECTION)"
 
 # Exits with 75, so the post-checkout hook can leave phase 2 of worktree setup for later...
 function sail_stack_not_running {
@@ -162,6 +184,7 @@ function resolve_sail_stack {
 
     if [ ! -f "$CACHE" ]; then
         mkdir -p "${CACHE%/*}"
+        # shellcheck disable=SC2016
         printf '%s' "$CONFIG" | "$SAIL_DOCKER_BINARY" run --rm -i --entrypoint php "$APP_IMAGE" -r '
             $config = json_decode(stream_get_contents(STDIN), true);
             $service = $config["services"][$argv[1]];
@@ -174,7 +197,7 @@ function resolve_sail_stack {
             foreach ($service["extra_hosts"] ?? [] as $host) {
                 echo "--add-host\0", $host, "\0";
             }
-        ' -- "$APP_SERVICE" > "$CACHE.$$" || exit 1
+        ' -- "$APP_SERVICE" > "$CACHE.$$" || { rm -f "$CACHE.$$"; exit 1; }
         mv "$CACHE.$$" "$CACHE"
     fi
 
@@ -191,10 +214,8 @@ function resolve_sail_stack {
 }
 
 # Set ARGS to the docker run arguments of a throwaway container, up to its image, with
-# CONTAINER_ARGS as extra arguments...
+# CONTAINER_ARGS as extra arguments. Needs a resolved Sail stack...
 function throwaway_container_args {
-    resolve_sail_stack
-
     interactive_args run --rm
     ARGS+=("${SERVICE_ARGS[@]}")
     ARGS+=(-e "WWWUSER=$WWWUSER" "${CONTAINER_ARGS[@]}")
@@ -214,11 +235,12 @@ function throwaway_container_args {
 # Run a command in a throwaway container...
 function run_in_throwaway_container {
     ensure_worktree_setup
+    resolve_sail_stack
     throwaway_container_args
     exec "$SAIL_DOCKER_BINARY" "${ARGS[@]}" "$APP_IMAGE" "$@"
 }
 
-# Run a command in a throwaway container and return its exit code...
+# Run a command in a throwaway container and return its exit code. Needs a resolved Sail stack...
 function run_in_setup_container {
     throwaway_container_args
     "$SAIL_DOCKER_BINARY" "${ARGS[@]}" "$APP_IMAGE" "$@"
@@ -240,29 +262,25 @@ function copy_tree {
     fi
 }
 
-# Take a lock: a symlink to the holder's PID, which ln creates atomically. A lock whose holder
-# died is broken by one waiter at a time, and only while it still names that holder...
+# Take a lock: a symlink to the holder's PID, which ln creates atomically. A waiter breaks a lock
+# whose holder is gone by renaming it to a name of its own, which only one waiter can do. A waiter
+# that moved a newer lock than the one it saw puts that lock back...
 function acquire_lock {
-    local HOLDER BREAKER
+    local HOLDER MOVED
 
     mkdir -p "${1%/*}" || exit 1
 
     until ln -s "$$" "$1" 2> /dev/null; do
         HOLDER="$(readlink "$1" 2> /dev/null)"
 
-        if [ -n "$HOLDER" ] && ! kill -0 "$HOLDER" 2> /dev/null; then
-            if ln -s "$$" "$1.break" 2> /dev/null; then
-                if [ "$(readlink "$1" 2> /dev/null)" == "$HOLDER" ]; then
-                    rm -f "$1"
-                fi
-                rm -f "$1.break"
-                continue
+        # ps, unlike kill -0, also sees another user's process...
+        if [ -n "$HOLDER" ] && ! ps -p "$HOLDER" > /dev/null 2>&1 && mv "$1" "$1.$$" 2> /dev/null; then
+            MOVED="$(readlink "$1.$$")"
+            rm -f "$1.$$"
+            if [ "$MOVED" != "$HOLDER" ]; then
+                ln -s "$MOVED" "$1" 2> /dev/null
             fi
-
-            BREAKER="$(readlink "$1.break" 2> /dev/null)"
-            if [ -n "$BREAKER" ] && ! kill -0 "$BREAKER" 2> /dev/null; then
-                rm -f "$1.break"
-            fi
+            continue
         fi
 
         sleep 1
@@ -275,7 +293,7 @@ function release_lock {
     fi
 }
 
-STATE_DIR="$GIT_DIR/sail-worktree"
+STATE_DIR="$WT_GIT_DIR/sail-worktree"
 SETUP_LOCK="$STATE_DIR/setup.lock"
 SETUP_COMPLETE="$STATE_DIR/setup-complete"
 
@@ -322,7 +340,7 @@ function finish_setup {
     run_after_setup_step
 }
 
-# Run worktree setup under the per-worktree lock. "hook": when the Sail stack is down, run only
+# Run worktree setup under the linked worktree's lock. "hook": when the Sail stack is down, run only
 # phase 1 and leave phase 2 to the first sail command. "lazy": run only if no earlier setup
 # finished, which a concurrent command may have done while this one waited for the lock...
 function worktree_setup {
@@ -370,7 +388,7 @@ function ensure_worktree_setup {
 # A lockfile is not installed again until it changes: the last installed copy of each lockfile is
 # kept in the linked worktree's git dir...
 function sync_dependencies {
-    local LOCKFILE DIR INSTALL
+    local LOCKFILE DIR INSTALL NODE_LOCKFILE=""
 
     for LOCKFILE in composer.lock package-lock.json pnpm-lock.yaml yarn.lock bun.lock bun.lockb; do
         [ -f "$WORKTREE_DIR/$LOCKFILE" ] || continue
@@ -378,9 +396,12 @@ function sync_dependencies {
         if [ "$LOCKFILE" == "composer.lock" ]; then
             DIR=vendor
             INSTALL=(composer install --no-interaction)
-        elif [ "$DIR" == "node_modules" ]; then
-            continue
         else
+            # The first Node lockfile, in the order above, chooses the package manager...
+            if [ -n "$NODE_LOCKFILE" ]; then
+                continue
+            fi
+            NODE_LOCKFILE="$LOCKFILE"
             DIR=node_modules
             case "$LOCKFILE" in
                 package-lock.json) INSTALL=(npm ci) ;;
@@ -424,7 +445,7 @@ function run_after_setup_step {
 function check_database_driver {
     case "$DB_CONNECTION" in
         pgsql|mysql|mariadb|sqlite) ;;
-        *) worktree_fail "Sail worktrees do not support the database driver '$DB_CONNECTION'." ;;
+        *) worktree_fail "Sail in linked worktrees does not support the database driver '$DB_CONNECTION'." ;;
     esac
 }
 
@@ -610,7 +631,9 @@ case "$1" in
     mongodb)
         shift 1
         CONTAINER="$(running_container mongodb)" || exit 1
-        exec_in_container "$CONTAINER" mongosh --port 27017 --username "$MONGODB_USERNAME" --password "$MONGODB_PASSWORD" --authenticationDatabase admin "$@"
+        # The credentials of the main checkout's mongodb service, which need no linked worktree env file...
+        exec_in_container "$CONTAINER" mongosh --port 27017 --username "$(main_env MONGODB_USERNAME)" \
+            --password "$(main_env MONGODB_PASSWORD)" --authenticationDatabase admin "$@"
         ;;
     test)
         shift 1

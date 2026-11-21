@@ -202,6 +202,12 @@ function forward_agent_env() {
     done
 }
 
+# Hand off to the worktree script in a linked git worktree, or for "sail worktree ..."...
+if [ "$1" == "worktree" ] || [ "$(cd "$(git rev-parse --git-dir 2> /dev/null)" 2> /dev/null && pwd -P)" != "$(cd "$(git rev-parse --git-common-dir 2> /dev/null)" 2> /dev/null && pwd -P)" ]; then
+    # shellcheck source=/dev/null
+    source "$(dirname "${BASH_SOURCE[0]}")/sail-worktree"
+fi
+
 # Define Docker Compose command prefix...
 if ${SAIL_DOCKER_BINARY} compose &> /dev/null; then
     COMPOSE_CMD=(${SAIL_DOCKER_BINARY} compose)
@@ -222,12 +228,6 @@ if [ -n "$SAIL_FILES" ]; then
             exit 1
         fi
     done
-fi
-
-# Hand off to the worktree script in a linked git worktree, or for "sail worktree ..."...
-if [ "$1" == "worktree" ] || [ "$(git rev-parse --path-format=absolute --git-dir 2> /dev/null)" != "$(git rev-parse --path-format=absolute --git-common-dir 2> /dev/null)" ]; then
-    # shellcheck source=/dev/null
-    source "$(dirname "${BASH_SOURCE[0]}")/sail-worktree"
 fi
 
 EXEC="yes"
